@@ -2,13 +2,13 @@
 	<PropertyGroup>
 		<TargetFrameworks>netstandard2.0;net50;netcoreapp31;netcoreapp21</TargetFrameworks>
 		<AssemblyName>Caching.CSRedis</AssemblyName>
-		<PackageId>Caching.CSRedis</PackageId>
+		<PackageId>Caching.CSRedis.YahuiWong</PackageId>
 		<RootNamespace>Caching.CSRedis</RootNamespace>
-		<Version>3.6.60</Version>
+		<Version>1.0.0.1</Version>
 		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-		<PackageProjectUrl>https://github.com/2881099/csredis/tree/master/src/Microsoft.Extensions.Caching.CSRedis/README.md</PackageProjectUrl>
+		<PackageProjectUrl>https://github.com/YahuiWong/csredis/tree/master/src/Microsoft.Extensions.Caching.CSRedis/README.md</PackageProjectUrl>
 		<Description>分布式缓存 CSRedisCore 实现 Microsoft.Extensions.Caching</Description>
-		<RepositoryUrl>https://github.com/2881099/csredis/tree/master/src/Microsoft.Extensions.Caching.CSRedis/README.md</RepositoryUrl>
+		<RepositoryUrl>https://github.com/YahuiWong/csredis/tree/master/src/Microsoft.Extensions.Caching.CSRedis/README.md</RepositoryUrl>
 		<PackageTags>caching csredis redis c# 分布式缓存 集群 负载 cluster Microsoft.Extensions.Caching</PackageTags>
 		<SignAssembly>true</SignAssembly>
 		<AssemblyOriginatorKeyFile>key.snk</AssemblyOriginatorKeyFile>

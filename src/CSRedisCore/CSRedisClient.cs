@@ -8,6 +8,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.IO;
+using CSRedisCore.Internal.Diagnostic;
 
 namespace CSRedis
 {
@@ -462,6 +463,39 @@ namespace CSRedis
             }
             return ing;
         }
+        
+        T GetAndExecute<T>(RedisClientPool pool, DiagnosticContext context, Func<Object<RedisClient>, T> handler, int jump = 100, int errtimes = 0)
+        {
+            T r;
+            try
+            {
+                r = GetAndExecute<T>(pool, handler, jump, errtimes);
+                DateTimeOffset endTime = DateTimeOffset.UtcNow;
+                csRedisCoreDiagnostics.WriteStopped(context.activity, endTime, context);
+            }
+            catch (RedisException ex)
+            {
+                csRedisCoreDiagnostics.WriteException(context.activity, ex);
+                throw ex;
+            }
+            catch (RedisProtocolException ex)
+            {
+                csRedisCoreDiagnostics.WriteException(context.activity, ex);
+                throw ex;
+            }
+            catch (RedisClientException ex)
+            {
+                csRedisCoreDiagnostics.WriteException(context.activity, ex);
+                throw ex;
+            }
+            catch (Exception ex)
+            {
+                csRedisCoreDiagnostics.WriteException(context.activity, ex);
+                throw ex;
+            }
+
+            return r;
+        }
         T GetAndExecute<T>(RedisClientPool pool, Func<Object<RedisClient>, T> handler, int jump = 100, int errtimes = 0)
         {
             Object<RedisClient> obj = null;
@@ -537,7 +571,7 @@ namespace CSRedis
                 redirectObj.Value.Call("ASKING");
                 return handler(redirectObj);
             };
-            return GetAndExecute<T>(GetRedirectPool(redirect.Value, pool), redirectHander, jump - 1);
+            return GetAndExecute<T>(GetRedirectPool(redirect.Value, pool),redirectHander, jump - 1);
         }
         bool TryAddNode(string nodeKey, RedisClientPool pool)
         {
@@ -597,6 +631,12 @@ namespace CSRedis
 
         T NodesNotSupport<T>(string[] keys, T defaultValue, Func<Object<RedisClient>, string[], T> callback)
         {
+            DiagnosticContext context = new DiagnosticContext();
+            context.action = "NodesNotSupport<T>";
+            DateTimeOffset startTime = DateTimeOffset.UtcNow;
+
+            Activity? activity = null;
+            activity = csRedisCoreDiagnostics.WriteStarted(context, startTime);
             if (keys == null || keys.Any() == false) return defaultValue;
             var rules = Nodes.Count > 1 ? keys.Select(a => NodeRuleRaw(a)).Distinct() : new[] { Nodes.FirstOrDefault().Key };
             if (rules.Count() > 1) throw new Exception("由于开启了分区模式，keys 分散在多个节点，无法使用此功能");
@@ -604,12 +644,12 @@ namespace CSRedis
             string[] rkeys = new string[keys.Length];
             for (int a = 0; a < keys.Length; a++) rkeys[a] = string.Concat(pool.Prefix, keys[a]);
             if (rkeys.Length == 0) return defaultValue;
-            return GetAndExecute(pool, conn => callback(conn, rkeys));
+            return GetAndExecute(pool, context, conn => callback(conn, rkeys));
         }
-        T NodesNotSupport<T>(string key, Func<Object<RedisClient>, string, T> callback)
+        T NodesNotSupport<T>(string key,string action, Func<Object<RedisClient>, string, T> callback)
         {
             if (IsMultiNode) throw new Exception("由于开启了分区模式，无法使用此功能");
-            return ExecuteScalar<T>(key, callback);
+            return ExecuteScalar<T>(key, action,callback);
         }
 
         RedisClientPool GetNodeOrThrowNotFound(string nodeKey)
@@ -747,21 +787,37 @@ namespace CSRedis
         #endregion
 
         #region 分区方式 Execute
-        internal T ExecuteScalar<T>(string key, Func<Object<RedisClient>, string, T> hander)
+
+        private readonly DiagnosticsWriter csRedisCoreDiagnostics = new DiagnosticsWriter();
+        internal T ExecuteScalar<T>(string key,string action, Func<Object<RedisClient>, string, T> hander)
         {
+            DiagnosticContext context = new DiagnosticContext();
+            context.action = action;
+            context.key = key;
+            DateTimeOffset startTime = DateTimeOffset.UtcNow;
+         
+            context.activity=null;
+            context.activity = csRedisCoreDiagnostics.WriteStarted(context, startTime);
             if (key == null) return default(T);
             var pool = NodeRuleRaw == null || Nodes.Count == 1 ? Nodes.First().Value : (Nodes.TryGetValue(NodeRuleRaw(key), out var b) ? b : Nodes.First().Value);
             key = string.Concat(pool.Prefix, key);
-            return GetAndExecute(pool, conn => hander(conn, key));
+            return GetAndExecute(pool, context, conn => hander(conn, key)); 
         }
-        internal T[] ExecuteArray<T>(string[] key, Func<Object<RedisClient>, string[], T[]> hander)
+        internal T[] ExecuteArray<T>(string[] key,string action, Func<Object<RedisClient>, string[], T[]> hander)
         {
+            DiagnosticContext context = new DiagnosticContext();
+            context.action = action;
+            context.key = string.Join(",", key);
+            DateTimeOffset startTime = DateTimeOffset.UtcNow;
+
+            context.activity = null;
+            context.activity = csRedisCoreDiagnostics.WriteStarted(context, startTime);
             if (key == null || key.Any() == false) return new T[0];
             if (NodeRuleRaw == null || Nodes.Count == 1)
             {
                 var pool = Nodes.First().Value;
                 var keys = key.Select(a => string.Concat(pool.Prefix, a)).ToArray();
-                return GetAndExecute(pool, conn => hander(conn, keys));
+                return GetAndExecute(pool, context, conn => hander(conn, keys));
             }
             var rules = new Dictionary<string, List<(string, int)>>();
             for (var a = 0; a < key.Length; a++)
@@ -775,7 +831,7 @@ namespace CSRedis
             {
                 var pool = Nodes.TryGetValue(r.Key, out var b) ? b : Nodes.First().Value;
                 var keys = r.Value.Select(a => string.Concat(pool.Prefix, a.Item1)).ToArray();
-                GetAndExecute(pool, conn =>
+                GetAndExecute(pool, context, conn =>
                 {
                     var vals = hander(conn, keys);
                     for (var z = 0; z < r.Value.Count; z++)
@@ -787,14 +843,21 @@ namespace CSRedis
             }
             return ret;
         }
-        internal long ExecuteNonQuery(string[] key, Func<Object<RedisClient>, string[], long> hander)
+        internal long ExecuteNonQuery(string[] key,string action, Func<Object<RedisClient>, string[], long> hander)
         {
+            DiagnosticContext context = new DiagnosticContext();
+            context.action = action;
+            context.key = string.Join(",",key);
+            DateTimeOffset startTime = DateTimeOffset.UtcNow;
+
+            context.activity = null;
+            context.activity = csRedisCoreDiagnostics.WriteStarted(context, startTime);
             if (key == null || key.Any() == false) return 0;
             if (NodeRuleRaw == null || Nodes.Count == 1)
             {
                 var pool = Nodes.First().Value;
                 var keys = key.Select(a => string.Concat(pool.Prefix, a)).ToArray();
-                return GetAndExecute(pool, conn => hander(conn, keys));
+                return GetAndExecute(pool, context, conn => hander(conn, keys));
             }
             var rules = new Dictionary<string, List<string>>();
             for (var a = 0; a < key.Length; a++)
@@ -808,7 +871,7 @@ namespace CSRedis
             {
                 var pool = Nodes.TryGetValue(r.Key, out var b) ? b : Nodes.First().Value;
                 var keys = r.Value.Select(a => string.Concat(pool.Prefix, a)).ToArray();
-                affrows += GetAndExecute(pool, conn => hander(conn, keys));
+                affrows += GetAndExecute(pool, context, conn => hander(conn, keys));
             }
             return affrows;
         }
@@ -1337,7 +1400,7 @@ namespace CSRedis
         public object Eval(string script, string key, params object[] args)
         {
             var args2 = args?.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.Eval(script, new[] { k }, args2));
+            return ExecuteScalar(key, "Eval", (c, k) => c.Value.Eval(script, new[] { k }, args2));
         }
         /// <summary>
         /// 执行脚本
@@ -1349,7 +1412,7 @@ namespace CSRedis
         public object EvalSHA(string sha1, string key, params object[] args)
         {
             var args2 = args?.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.EvalSHA(sha1, new[] { k }, args2));
+            return ExecuteScalar(key, "EvalSHA", (c, k) => c.Value.EvalSHA(sha1, new[] { k }, args2));
         }
         /// <summary>
         /// 校验所有分区节点中，脚本是否已经缓存。任何分区节点未缓存sha1，都返回false。
@@ -1383,7 +1446,7 @@ namespace CSRedis
         public long Publish(string channel, string message)
         {
             var msgid = HIncrBy("csredisclient:Publish:msgid", channel, 1);
-            return ExecuteScalar(channel, (c, k) => c.Value.Publish(channel, $"{msgid}|{message}"));
+            return ExecuteScalar(channel, "Publish", (c, k) => c.Value.Publish(channel, $"{msgid}|{message}"));
         }
         /// <summary>
         /// 用于将信息发送到指定分区节点的频道，与 Publish 方法不同，不返回消息id头，即 1|
@@ -1391,7 +1454,7 @@ namespace CSRedis
         /// <param name="channel">频道名</param>
         /// <param name="message">消息文本</param>
         /// <returns></returns>
-        public long PublishNoneMessageId(string channel, string message) => ExecuteScalar(channel, (c, k) => c.Value.Publish(channel, message));
+        public long PublishNoneMessageId(string channel, string message) => ExecuteScalar(channel, "PublishNoneMessageId", (c, k) => c.Value.Publish(channel, message));
         /// <summary>
         /// 查看所有订阅频道
         /// </summary>
@@ -1415,7 +1478,7 @@ namespace CSRedis
         /// </summary>
         /// <param name="channels">频道</param>
         /// <returns></returns>
-        public Dictionary<string, long> PubSubNumSub(params string[] channels) => ExecuteArray(channels, (c, k) =>
+        public Dictionary<string, long> PubSubNumSub(params string[] channels) => ExecuteArray(channels, "PubSubNumSub", (c, k) =>
         {
             var prefix = (c.Pool as RedisClientPool).Prefix;
             return c.Value.PubSubNumSub(k.Select(z => string.IsNullOrEmpty(prefix) == false && z.StartsWith(prefix) ? z.Substring(prefix.Length) : z).ToArray());
@@ -2027,7 +2090,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (elements == null || elements.Any() == false) return false;
             var args = elements.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.PfAdd(k, args));
+            return ExecuteScalar(key, "PfAdd", (c, k) => c.Value.PfAdd(k, args));
         }
         /// <summary>
         /// 返回给定 HyperLogLog 的基数估算值<para></para>
@@ -2053,28 +2116,28 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">数量</param>
         /// <returns></returns>
-        public (string member, decimal score)[] ZPopMax(string key, long count) => ExecuteScalar(key, (c, k) => c.Value.ZPopMax(k, count)).Select(a => (a.Item1, a.Item2)).ToArray();
+        public (string member, decimal score)[] ZPopMax(string key, long count) => ExecuteScalar(key, "ZPopMax", (c, k) => c.Value.ZPopMax(k, count)).Select(a => (a.Item1, a.Item2)).ToArray();
         /// <summary>
         /// [redis-server 5.0.0] 删除并返回有序集合key中的最多count个具有最高得分的成员。如未指定，count的默认值为1。指定一个大于有序集合的基数的count不会产生错误。 当返回多个元素时候，得分最高的元素将是第一个元素，然后是分数较低的元素。
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">数量</param>
         /// <returns></returns>
-        public (T member, decimal score)[] ZPopMax<T>(string key, long count) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZPopMaxBytes(k, count)));
+        public (T member, decimal score)[] ZPopMax<T>(string key, long count) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZPopMax", (c, k) => c.Value.ZPopMaxBytes(k, count)));
         /// <summary>
         /// [redis-server 5.0.0] 删除并返回有序集合key中的最多count个具有最低得分的成员。如未指定，count的默认值为1。指定一个大于有序集合的基数的count不会产生错误。 当返回多个元素时候，得分最低的元素将是第一个元素，然后是分数较高的元素。
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">数量</param>
         /// <returns></returns>
-        public (string member, decimal score)[] ZPopMin(string key, long count) => ExecuteScalar(key, (c, k) => c.Value.ZPopMin(k, count)).Select(a => (a.Item1, a.Item2)).ToArray();
+        public (string member, decimal score)[] ZPopMin(string key, long count) => ExecuteScalar(key, "ZPopMin", (c, k) => c.Value.ZPopMin(k, count)).Select(a => (a.Item1, a.Item2)).ToArray();
         /// <summary>
         /// [redis-server 5.0.0] 删除并返回有序集合key中的最多count个具有最低得分的成员。如未指定，count的默认值为1。指定一个大于有序集合的基数的count不会产生错误。 当返回多个元素时候，得分最低的元素将是第一个元素，然后是分数较高的元素。
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">数量</param>
         /// <returns></returns>
-        public (T member, decimal score)[] ZPopMin<T>(string key, long count) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZPopMinBytes(k, count)));
+        public (T member, decimal score)[] ZPopMin<T>(string key, long count) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZPopMin", (c, k) => c.Value.ZPopMinBytes(k, count)));
 
         /// <summary>
         /// 向有序集合添加一个或多个成员，或者更新已存在成员的分数
@@ -2086,14 +2149,14 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (scoreMembers == null || scoreMembers.Any() == false) return 0;
             var args = scoreMembers.Select(a => new Tuple<decimal, object>(a.Item1, this.SerializeRedisValueInternal(a.Item2))).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.ZAdd(k, args));
+            return ExecuteScalar(key, "ZAdd", (c, k) => c.Value.ZAdd(k, args));
         }
         /// <summary>
         /// 获取有序集合的成员数量
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long ZCard(string key) => ExecuteScalar(key, (c, k) => c.Value.ZCard(k));
+        public long ZCard(string key) => ExecuteScalar(key, "ZCard", (c, k) => c.Value.ZCard(k));
         /// <summary>
         /// 计算在有序集合中指定区间分数的成员数量
         /// </summary>
@@ -2101,7 +2164,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="min">分数最小值 decimal.MinValue 1</param>
         /// <param name="max">分数最大值 decimal.MaxValue 10</param>
         /// <returns></returns>
-        public long ZCount(string key, decimal min, decimal max) => ExecuteScalar(key, (c, k) => c.Value.ZCount(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString()));
+        public long ZCount(string key, decimal min, decimal max) => ExecuteScalar(key, "ZCount", (c, k) => c.Value.ZCount(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString()));
         /// <summary>
         /// 计算在有序集合中指定区间分数的成员数量
         /// </summary>
@@ -2109,7 +2172,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="min">分数最小值 -inf (1 1</param>
         /// <param name="max">分数最大值 +inf (10 10</param>
         /// <returns></returns>
-        public long ZCount(string key, string min, string max) => ExecuteScalar(key, (c, k) => c.Value.ZCount(k, min, max));
+        public long ZCount(string key, string min, string max) => ExecuteScalar(key, "ZCount", (c, k) => c.Value.ZCount(k, min, max));
         /// <summary>
         /// 有序集合中对指定成员的分数加上增量 increment
         /// </summary>
@@ -2120,7 +2183,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public decimal ZIncrBy(string key, object member, decimal increment = 1)
         {
             var args = this.SerializeRedisValueInternal(member);
-            return ExecuteScalar(key, (c, k) => c.Value.ZIncrBy(k, increment, args));
+            return ExecuteScalar(key, "ZIncrBy", (c, k) => c.Value.ZIncrBy(k, increment, args));
         }
 
         /// <summary>
@@ -2145,7 +2208,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public string[] ZRange(string key, long start, long stop) => ExecuteScalar(key, (c, k) => c.Value.ZRange(k, start, stop, false));
+        public string[] ZRange(string key, long start, long stop) => ExecuteScalar(key, "ZRange", (c, k) => c.Value.ZRange(k, start, stop, false));
         /// <summary>
         /// 通过索引区间返回有序集合成指定区间内的成员
         /// </summary>
@@ -2154,7 +2217,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public T[] ZRange<T>(string key, long start, long stop) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.ZRangeBytes(k, start, stop, false)));
+        public T[] ZRange<T>(string key, long start, long stop) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "ZRange", (c, k) => c.Value.ZRangeBytes(k, start, stop, false)));
         /// <summary>
         /// 通过索引区间返回有序集合成指定区间内的成员和分数
         /// </summary>
@@ -2162,7 +2225,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public (string member, decimal score)[] ZRangeWithScores(string key, long start, long stop) => ExecuteScalar(key, (c, k) => c.Value.ZRangeWithScores(k, start, stop)).Select(a => (a.Item1, a.Item2)).ToArray();
+        public (string member, decimal score)[] ZRangeWithScores(string key, long start, long stop) => ExecuteScalar(key, "ZRangeWithScores", (c, k) => c.Value.ZRangeWithScores(k, start, stop)).Select(a => (a.Item1, a.Item2)).ToArray();
         /// <summary>
         /// 通过索引区间返回有序集合成指定区间内的成员和分数
         /// </summary>
@@ -2171,7 +2234,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public (T member, decimal score)[] ZRangeWithScores<T>(string key, long start, long stop) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZRangeBytesWithScores(k, start, stop)));
+        public (T member, decimal score)[] ZRangeWithScores<T>(string key, long start, long stop) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZRangeWithScores", (c, k) => c.Value.ZRangeBytesWithScores(k, start, stop)));
 
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员
@@ -2183,7 +2246,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public string[] ZRangeByScore(string key, decimal min, decimal max, long? count = null, long offset = 0) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRangeByScore(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), false, offset, count));
+            ExecuteScalar(key, "ZRangeByScore", (c, k) => c.Value.ZRangeByScore(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), false, offset, count));
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员
         /// </summary>
@@ -2195,7 +2258,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public T[] ZRangeByScore<T>(string key, decimal min, decimal max, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.ZRangeBytesByScore(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), false, offset, count)));
+            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "ZRangeByScore", (c, k) => c.Value.ZRangeBytesByScore(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), false, offset, count)));
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员
         /// </summary>
@@ -2206,7 +2269,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public string[] ZRangeByScore(string key, string min, string max, long? count = null, long offset = 0) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRangeByScore(k, min, max, false, offset, count));
+            ExecuteScalar(key, "ZRangeByScore", (c, k) => c.Value.ZRangeByScore(k, min, max, false, offset, count));
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员
         /// </summary>
@@ -2218,7 +2281,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public T[] ZRangeByScore<T>(string key, string min, string max, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.ZRangeBytesByScore(k, min, max, false, offset, count)));
+            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "ZRangeByScore<T>", (c, k) => c.Value.ZRangeBytesByScore(k, min, max, false, offset, count)));
 
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员和分数
@@ -2230,7 +2293,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (string member, decimal score)[] ZRangeByScoreWithScores(string key, decimal min, decimal max, long? count = null, long offset = 0) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRangeByScoreWithScores(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
+            ExecuteScalar(key, "ZRangeByScoreWithScores", (c, k) => c.Value.ZRangeByScoreWithScores(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员和分数
         /// </summary>
@@ -2242,7 +2305,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (T member, decimal score)[] ZRangeByScoreWithScores<T>(string key, decimal min, decimal max, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZRangeBytesByScoreWithScores(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), offset, count)));
+            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZRangeByScoreWithScores<T>", (c, k) => c.Value.ZRangeBytesByScoreWithScores(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString(), offset, count)));
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员和分数
         /// </summary>
@@ -2253,7 +2316,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (string member, decimal score)[] ZRangeByScoreWithScores(string key, string min, string max, long? count = null, long offset = 0) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRangeByScoreWithScores(k, min, max, offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
+            ExecuteScalar(key, "ZRangeByScoreWithScores", (c, k) => c.Value.ZRangeByScoreWithScores(k, min, max, offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
         /// <summary>
         /// 通过分数返回有序集合指定区间内的成员和分数
         /// </summary>
@@ -2265,7 +2328,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (T member, decimal score)[] ZRangeByScoreWithScores<T>(string key, string min, string max, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZRangeBytesByScoreWithScores(k, min, max, offset, count)));
+            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZRangeByScoreWithScores<T>", (c, k) => c.Value.ZRangeBytesByScoreWithScores(k, min, max, offset, count)));
 
         /// <summary>
         /// 返回有序集合中指定成员的索引
@@ -2276,7 +2339,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long? ZRank(string key, object member)
         {
             var args = this.SerializeRedisValueInternal(member);
-            return ExecuteScalar(key, (c, k) => c.Value.ZRank(k, args));
+            return ExecuteScalar(key, "ZRank", (c, k) => c.Value.ZRank(k, args));
         }
         /// <summary>
         /// 移除有序集合中的一个或多个成员
@@ -2288,7 +2351,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (member == null || member.Any() == false) return 0;
             var args = member.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.ZRem(k, args));
+            return ExecuteScalar(key, "ZRem<T>", (c, k) => c.Value.ZRem(k, args));
         }
         /// <summary>
         /// 移除有序集合中给定的排名区间的所有成员
@@ -2297,7 +2360,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public long ZRemRangeByRank(string key, long start, long stop) => ExecuteScalar(key, (c, k) => c.Value.ZRemRangeByRank(k, start, stop));
+        public long ZRemRangeByRank(string key, long start, long stop) => ExecuteScalar(key, "ZRemRangeByRank", (c, k) => c.Value.ZRemRangeByRank(k, start, stop));
         /// <summary>
         /// 移除有序集合中给定的分数区间的所有成员
         /// </summary>
@@ -2305,7 +2368,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="min">分数最小值 decimal.MinValue 1</param>
         /// <param name="max">分数最大值 decimal.MaxValue 10</param>
         /// <returns></returns>
-        public long ZRemRangeByScore(string key, decimal min, decimal max) => ExecuteScalar(key, (c, k) => c.Value.ZRemRangeByScore(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString()));
+        public long ZRemRangeByScore(string key, decimal min, decimal max) => ExecuteScalar(key, "ZRemRangeByScore", (c, k) => c.Value.ZRemRangeByScore(k, min == decimal.MinValue ? "-inf" : min.ToString(), max == decimal.MaxValue ? "+inf" : max.ToString()));
         /// <summary>
         /// 移除有序集合中给定的分数区间的所有成员
         /// </summary>
@@ -2313,7 +2376,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="min">分数最小值 -inf (1 1</param>
         /// <param name="max">分数最大值 +inf (10 10</param>
         /// <returns></returns>
-        public long ZRemRangeByScore(string key, string min, string max) => ExecuteScalar(key, (c, k) => c.Value.ZRemRangeByScore(k, min, max));
+        public long ZRemRangeByScore(string key, string min, string max) => ExecuteScalar(key, "ZRemRangeByScore", (c, k) => c.Value.ZRemRangeByScore(k, min, max));
 
         /// <summary>
         /// 返回有序集中指定区间内的成员，通过索引，分数从高到底
@@ -2322,7 +2385,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public string[] ZRevRange(string key, long start, long stop) => ExecuteScalar(key, (c, k) => c.Value.ZRevRange(k, start, stop, false));
+        public string[] ZRevRange(string key, long start, long stop) => ExecuteScalar(key, "ZRevRange", (c, k) => c.Value.ZRevRange(k, start, stop, false));
         /// <summary>
         /// 返回有序集中指定区间内的成员，通过索引，分数从高到底
         /// </summary>
@@ -2331,7 +2394,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public T[] ZRevRange<T>(string key, long start, long stop) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.ZRevRangeBytes(k, start, stop, false)));
+        public T[] ZRevRange<T>(string key, long start, long stop) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "ZRevRange<T>", (c, k) => c.Value.ZRevRangeBytes(k, start, stop, false)));
         /// <summary>
         /// 返回有序集中指定区间内的成员和分数，通过索引，分数从高到底
         /// </summary>
@@ -2339,7 +2402,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public (string member, decimal score)[] ZRevRangeWithScores(string key, long start, long stop) => ExecuteScalar(key, (c, k) => c.Value.ZRevRangeWithScores(k, start, stop)).Select(a => (a.Item1, a.Item2)).ToArray();
+        public (string member, decimal score)[] ZRevRangeWithScores(string key, long start, long stop) => ExecuteScalar(key, "ZRevRangeWithScores", (c, k) => c.Value.ZRevRangeWithScores(k, start, stop)).Select(a => (a.Item1, a.Item2)).ToArray();
         /// <summary>
         /// 返回有序集中指定区间内的成员和分数，通过索引，分数从高到底
         /// </summary>
@@ -2348,7 +2411,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public (T member, decimal score)[] ZRevRangeWithScores<T>(string key, long start, long stop) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZRevRangeBytesWithScores(k, start, stop)));
+        public (T member, decimal score)[] ZRevRangeWithScores<T>(string key, long start, long stop) => this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZRevRangeWithScores<T>", (c, k) => c.Value.ZRevRangeBytesWithScores(k, start, stop)));
 
         /// <summary>
         /// 返回有序集中指定分数区间内的成员，分数从高到低排序
@@ -2359,7 +2422,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="count">返回多少成员</param>
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
-        public string[] ZRevRangeByScore(string key, decimal max, decimal min, long? count = null, long? offset = 0) => ExecuteScalar(key, (c, k) => c.Value.ZRevRangeByScore(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), false, offset, count));
+        public string[] ZRevRangeByScore(string key, decimal max, decimal min, long? count = null, long? offset = 0) => ExecuteScalar(key, "ZRevRangeByScore", (c, k) => c.Value.ZRevRangeByScore(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), false, offset, count));
         /// <summary>
         /// 返回有序集中指定分数区间内的成员，分数从高到低排序
         /// </summary>
@@ -2371,7 +2434,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public T[] ZRevRangeByScore<T>(string key, decimal max, decimal min, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.ZRevRangeBytesByScore(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), false, offset, count)));
+            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "ZRevRangeByScore<T>", (c, k) => c.Value.ZRevRangeBytesByScore(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), false, offset, count)));
         /// <summary>
         /// 返回有序集中指定分数区间内的成员，分数从高到低排序
         /// </summary>
@@ -2381,7 +2444,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="count">返回多少成员</param>
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
-        public string[] ZRevRangeByScore(string key, string max, string min, long? count = null, long? offset = 0) => ExecuteScalar(key, (c, k) => c.Value.ZRevRangeByScore(k, max, min, false, offset, count));
+        public string[] ZRevRangeByScore(string key, string max, string min, long? count = null, long? offset = 0) => ExecuteScalar(key, "ZRevRangeByScore", (c, k) => c.Value.ZRevRangeByScore(k, max, min, false, offset, count));
         /// <summary>
         /// 返回有序集中指定分数区间内的成员，分数从高到低排序
         /// </summary>
@@ -2393,7 +2456,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public T[] ZRevRangeByScore<T>(string key, string max, string min, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.ZRevRangeBytesByScore(k, max, min, false, offset, count)));
+            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "ZRevRangeByScore<T>", (c, k) => c.Value.ZRevRangeBytesByScore(k, max, min, false, offset, count)));
 
         /// <summary>
         /// 返回有序集中指定分数区间内的成员和分数，分数从高到低排序
@@ -2405,7 +2468,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (string member, decimal score)[] ZRevRangeByScoreWithScores(string key, decimal max, decimal min, long? count = null, long offset = 0) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRevRangeByScoreWithScores(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
+            ExecuteScalar(key, "ZRevRangeByScoreWithScores", (c, k) => c.Value.ZRevRangeByScoreWithScores(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
         /// <summary>
         /// 返回有序集中指定分数区间内的成员和分数，分数从高到低排序
         /// </summary>
@@ -2417,7 +2480,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (T member, decimal score)[] ZRevRangeByScoreWithScores<T>(string key, decimal max, decimal min, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZRevRangeBytesByScoreWithScores(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), offset, count)));
+            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZRevRangeByScoreWithScores<T>", (c, k) => c.Value.ZRevRangeBytesByScoreWithScores(k, max == decimal.MaxValue ? "+inf" : max.ToString(), min == decimal.MinValue ? "-inf" : min.ToString(), offset, count)));
         /// <summary>
         /// 返回有序集中指定分数区间内的成员和分数，分数从高到低排序
         /// </summary>
@@ -2428,7 +2491,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (string member, decimal score)[] ZRevRangeByScoreWithScores(string key, string max, string min, long? count = null, long offset = 0) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRevRangeByScoreWithScores(k, max, min, offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
+            ExecuteScalar(key, "ZRevRangeByScoreWithScores", (c, k) => c.Value.ZRevRangeByScoreWithScores(k, max, min, offset, count)).Select(z => (z.Item1, z.Item2)).ToArray();
         /// <summary>
         /// 返回有序集中指定分数区间内的成员和分数，分数从高到低排序
         /// </summary>
@@ -2440,7 +2503,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public (T member, decimal score)[] ZRevRangeByScoreWithScores<T>(string key, string max, string min, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, (c, k) => c.Value.ZRevRangeBytesByScoreWithScores(k, max, min, offset, count)));
+            this.DeserializeRedisValueTuple1Internal<T, decimal>(ExecuteScalar(key, "ZRevRangeByScoreWithScores<T>", (c, k) => c.Value.ZRevRangeBytesByScoreWithScores(k, max, min, offset, count)));
 
         /// <summary>
         /// 返回有序集合中指定成员的排名，有序集成员按分数值递减(从大到小)排序
@@ -2451,7 +2514,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long? ZRevRank(string key, object member)
         {
             var args = this.SerializeRedisValueInternal(member);
-            return ExecuteScalar(key, (c, k) => c.Value.ZRevRank(k, args));
+            return ExecuteScalar(key, "ZRevRank", (c, k) => c.Value.ZRevRank(k, args));
         }
         /// <summary>
         /// 返回有序集中，成员的分数值
@@ -2462,7 +2525,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public decimal? ZScore(string key, object member)
         {
             var args = this.SerializeRedisValueInternal(member);
-            return ExecuteScalar(key, (c, k) => c.Value.ZScore(k, args));
+            return ExecuteScalar(key, "ZScore", (c, k) => c.Value.ZScore(k, args));
         }
 
         /// <summary>
@@ -2490,7 +2553,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <returns></returns>
         public RedisScan<(string member, decimal score)> ZScan(string key, long cursor, string pattern = null, long? count = null)
         {
-            var scan = ExecuteScalar(key, (c, k) => c.Value.ZScan(k, cursor, pattern, count));
+            var scan = ExecuteScalar(key, "ZScan", (c, k) => c.Value.ZScan(k, cursor, pattern, count));
             return new RedisScan<(string, decimal)>(scan.Cursor, scan.Items.Select(z => (z.Item1, z.Item2)).ToArray());
         }
         /// <summary>
@@ -2504,7 +2567,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <returns></returns>
         public RedisScan<(T member, decimal score)> ZScan<T>(string key, long cursor, string pattern = null, long? count = null)
         {
-            var scan = ExecuteScalar(key, (c, k) => c.Value.ZScanBytes(k, cursor, pattern, count));
+            var scan = ExecuteScalar(key, "ZScan<T>", (c, k) => c.Value.ZScanBytes(k, cursor, pattern, count));
             return new RedisScan<(T, decimal)>(scan.Cursor, this.DeserializeRedisValueTuple1Internal<T, decimal>(scan.Items));
         }
 
@@ -2518,7 +2581,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public string[] ZRangeByLex(string key, string min, string max, long? count = null, long offset = 0) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRangeByLex(k, min, max, offset, count));
+            ExecuteScalar(key, "ZRangeByLex", (c, k) => c.Value.ZRangeByLex(k, min, max, offset, count));
         /// <summary>
         /// 当有序集合的所有成员都具有相同的分值时，有序集合的元素会根据成员的字典序来进行排序，这个命令可以返回给定的有序集合键 key 中，值介于 min 和 max 之间的成员。
         /// </summary>
@@ -2530,7 +2593,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">返回条件偏移位置</param>
         /// <returns></returns>
         public T[] ZRangeByLex<T>(string key, string min, string max, long? count = null, long offset = 0) =>
-            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.ZRangeBytesByLex(k, min, max, offset, count)));
+            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "ZRangeByLex<T>", (c, k) => c.Value.ZRangeBytesByLex(k, min, max, offset, count)));
 
         /// <summary>
         /// 当有序集合的所有成员都具有相同的分值时，有序集合的元素会根据成员的字典序来进行排序，这个命令可以返回给定的有序集合键 key 中，值介于 min 和 max 之间的成员。
@@ -2540,7 +2603,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="max">'(' 表示包含在范围，'[' 表示不包含在范围，'+' 正无穷大，'-' 负无限。 ZRANGEBYLEX zset - + ，命令将返回有序集合中的所有元素</param>
         /// <returns></returns>
         public long ZRemRangeByLex(string key, string min, string max) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZRemRangeByLex(k, min, max));
+            ExecuteScalar(key, "ZRemRangeByLex", (c, k) => c.Value.ZRemRangeByLex(k, min, max));
         /// <summary>
         /// 当有序集合的所有成员都具有相同的分值时，有序集合的元素会根据成员的字典序来进行排序，这个命令可以返回给定的有序集合键 key 中，值介于 min 和 max 之间的成员。
         /// </summary>
@@ -2549,7 +2612,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="max">'(' 表示包含在范围，'[' 表示不包含在范围，'+' 正无穷大，'-' 负无限。 ZRANGEBYLEX zset - + ，命令将返回有序集合中的所有元素</param>
         /// <returns></returns>
         public long ZLexCount(string key, string min, string max) =>
-            ExecuteScalar(key, (c, k) => c.Value.ZLexCount(k, min, max));
+            ExecuteScalar(key, "ZLexCount", (c, k) => c.Value.ZLexCount(k, min, max));
         #endregion
 
         #region Set
@@ -2563,14 +2626,14 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (members == null || members.Any() == false) return 0;
             var args = members.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.SAdd(k, args));
+            return ExecuteScalar(key, "SAdd<T>", (c, k) => c.Value.SAdd(k, args));
         }
         /// <summary>
         /// 获取集合的成员数
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long SCard(string key) => ExecuteScalar(key, (c, k) => c.Value.SCard(k));
+        public long SCard(string key) => ExecuteScalar(key, "SCard", (c, k) => c.Value.SCard(k));
         /// <summary>
         /// 返回给定所有集合的差集
         /// </summary>
@@ -2620,21 +2683,21 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public bool SIsMember(string key, object member)
         {
             var args = this.SerializeRedisValueInternal(member);
-            return ExecuteScalar(key, (c, k) => c.Value.SIsMember(k, args));
+            return ExecuteScalar(key, "SIsMember", (c, k) => c.Value.SIsMember(k, args));
         }
         /// <summary>
         /// 返回集合中的所有成员
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string[] SMembers(string key) => ExecuteScalar(key, (c, k) => c.Value.SMembers(k));
+        public string[] SMembers(string key) => ExecuteScalar(key, "SMembers", (c, k) => c.Value.SMembers(k));
         /// <summary>
         /// 返回集合中的所有成员
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public T[] SMembers<T>(string key) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.SMembersBytes(k)));
+        public T[] SMembers<T>(string key) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "SMembers<T>", (c, k) => c.Value.SMembersBytes(k)));
         /// <summary>
         /// 将 member 元素从 source 集合移动到 destination 集合
         /// </summary>
@@ -2667,21 +2730,21 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string SPop(string key) => ExecuteScalar(key, (c, k) => c.Value.SPop(k));
+        public string SPop(string key) => ExecuteScalar(key, "SPop", (c, k) => c.Value.SPop(k));
         /// <summary>
         /// 移除并返回集合中的一个随机元素
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public T SPop<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.SPopBytes(k)));
+        public T SPop<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "SPop<T>", (c, k) => c.Value.SPopBytes(k)));
         /// <summary>
         /// [redis-server 3.2] 移除并返回集合中的一个或多个随机元素
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">移除并返回的个数</param>
         /// <returns></returns>
-        public string[] SPop(string key, long count) => ExecuteScalar(key, (c, k) => c.Value.SPop(k, count));
+        public string[] SPop(string key, long count) => ExecuteScalar(key, "SPop", (c, k) => c.Value.SPop(k, count));
         /// <summary>
         /// [redis-server 3.2] 移除并返回集合中的一个或多个随机元素
         /// </summary>
@@ -2689,27 +2752,27 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">移除并返回的个数</param>
         /// <returns></returns>
-        public T[] SPop<T>(string key, long count) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.SPopBytes(k, count)));
+        public T[] SPop<T>(string key, long count) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "SPop<T>", (c, k) => c.Value.SPopBytes(k, count)));
         /// <summary>
         /// 返回集合中的一个随机元素
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string SRandMember(string key) => ExecuteScalar(key, (c, k) => c.Value.SRandMember(k));
+        public string SRandMember(string key) => ExecuteScalar(key, "SRandMember", (c, k) => c.Value.SRandMember(k));
         /// <summary>
         /// 返回集合中的一个随机元素
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public T SRandMember<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.SRandMemberBytes(k)));
+        public T SRandMember<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "SRandMember<T>", (c, k) => c.Value.SRandMemberBytes(k)));
         /// <summary>
         /// 返回集合中一个或多个随机数的元素
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">返回个数</param>
         /// <returns></returns>
-        public string[] SRandMembers(string key, int count = 1) => ExecuteScalar(key, (c, k) => c.Value.SRandMembers(k, count));
+        public string[] SRandMembers(string key, int count = 1) => ExecuteScalar(key, "SRandMembers", (c, k) => c.Value.SRandMembers(k, count));
         /// <summary>
         /// 返回集合中一个或多个随机数的元素
         /// </summary>
@@ -2717,7 +2780,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="count">返回个数</param>
         /// <returns></returns>
-        public T[] SRandMembers<T>(string key, int count = 1) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.SRandMembersBytes(k, count)));
+        public T[] SRandMembers<T>(string key, int count = 1) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "SRandMembers<T>", (c, k) => c.Value.SRandMembersBytes(k, count)));
         /// <summary>
         /// 移除集合中一个或多个成员
         /// </summary>
@@ -2728,7 +2791,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (members == null || members.Any() == false) return 0;
             var args = members.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.SRem(k, args));
+            return ExecuteScalar(key, "SRem<T>", (c, k) => c.Value.SRem(k, args));
         }
         /// <summary>
         /// 返回所有给定集合的并集
@@ -2758,7 +2821,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="pattern">模式</param>
         /// <param name="count">数量</param>
         /// <returns></returns>
-        public RedisScan<string> SScan(string key, long cursor, string pattern = null, long? count = null) => ExecuteScalar(key, (c, k) => c.Value.SScan(k, cursor, pattern, count));
+        public RedisScan<string> SScan(string key, long cursor, string pattern = null, long? count = null) => ExecuteScalar(key, "SScan", (c, k) => c.Value.SScan(k, cursor, pattern, count));
         /// <summary>
         /// 迭代集合中的元素
         /// </summary>
@@ -2770,7 +2833,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <returns></returns>
         public RedisScan<T> SScan<T>(string key, long cursor, string pattern = null, long? count = null)
         {
-            var scan = ExecuteScalar(key, (c, k) => c.Value.SScanBytes(k, cursor, pattern, count));
+            var scan = ExecuteScalar(key, "SScan<T>", (c, k) => c.Value.SScanBytes(k, cursor, pattern, count));
             return new RedisScan<T>(scan.Cursor, this.DeserializeRedisValueArrayInternal<T>(scan.Items));
         }
         #endregion
@@ -2885,7 +2948,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="index">索引</param>
         /// <returns></returns>
-        public string LIndex(string key, long index) => ExecuteScalar(key, (c, k) => c.Value.LIndex(k, index));
+        public string LIndex(string key, long index) => ExecuteScalar(key, "LIndex", (c, k) => c.Value.LIndex(k, index));
         /// <summary>
         /// 通过索引获取列表中的元素
         /// </summary>
@@ -2893,7 +2956,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="index">索引</param>
         /// <returns></returns>
-        public T LIndex<T>(string key, long index) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.LIndexBytes(k, index)));
+        public T LIndex<T>(string key, long index) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "LIndex<T>", (c, k) => c.Value.LIndexBytes(k, index)));
         /// <summary>
         /// 在列表中的元素前面插入元素
         /// </summary>
@@ -2904,7 +2967,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long LInsertBefore(string key, object pivot, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.LInsert(k, RedisInsert.Before, pivot, args));
+            return ExecuteScalar(key, "LInsertBefore", (c, k) => c.Value.LInsert(k, RedisInsert.Before, pivot, args));
         }
         /// <summary>
         /// 在列表中的元素后面插入元素
@@ -2916,27 +2979,27 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long LInsertAfter(string key, object pivot, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.LInsert(k, RedisInsert.After, pivot, args));
+            return ExecuteScalar(key, "LInsertAfter", (c, k) => c.Value.LInsert(k, RedisInsert.After, pivot, args));
         }
         /// <summary>
         /// 获取列表长度
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long LLen(string key) => ExecuteScalar(key, (c, k) => c.Value.LLen(k));
+        public long LLen(string key) => ExecuteScalar(key, "LLen", (c, k) => c.Value.LLen(k));
         /// <summary>
         /// 移出并获取列表的第一个元素
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string LPop(string key) => ExecuteScalar(key, (c, k) => c.Value.LPop(k));
+        public string LPop(string key) => ExecuteScalar(key, "LPop", (c, k) => c.Value.LPop(k));
         /// <summary>
         /// 移出并获取列表的第一个元素
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public T LPop<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.LPopBytes(k)));
+        public T LPop<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "LPop<T>", (c, k) => c.Value.LPopBytes(k)));
         /// <summary>
         /// 将一个或多个值插入到列表头部
         /// </summary>
@@ -2947,7 +3010,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (value == null || value.Any() == false) return 0;
             var args = value.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.LPush(k, args));
+            return ExecuteScalar(key, "LPush<T>", (c, k) => c.Value.LPush(k, args));
         }
         /// <summary>
         /// 将一个值插入到已存在的列表头部
@@ -2958,7 +3021,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long LPushX(string key, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.LPushX(k, args));
+            return ExecuteScalar(key, "LPushX", (c, k) => c.Value.LPushX(k, args));
         }
         /// <summary>
         /// 获取列表指定范围内的元素
@@ -2967,7 +3030,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public string[] LRange(string key, long start, long stop) => ExecuteScalar(key, (c, k) => c.Value.LRange(k, start, stop));
+        public string[] LRange(string key, long start, long stop) => ExecuteScalar(key, "LRange", (c, k) => c.Value.LRange(k, start, stop));
         /// <summary>
         /// 获取列表指定范围内的元素
         /// </summary>
@@ -2976,7 +3039,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public T[] LRange<T>(string key, long start, long stop) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.LRangeBytes(k, start, stop)));
+        public T[] LRange<T>(string key, long start, long stop) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "LRange<T>", (c, k) => c.Value.LRangeBytes(k, start, stop)));
         /// <summary>
         /// 根据参数 count 的值，移除列表中与参数 value 相等的元素
         /// </summary>
@@ -2987,7 +3050,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long LRem(string key, long count, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.LRem(k, count, args));
+            return ExecuteScalar(key, "LRem", (c, k) => c.Value.LRem(k, count, args));
         }
         /// <summary>
         /// 通过索引设置列表元素的值
@@ -2999,7 +3062,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public bool LSet(string key, long index, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.LSet(k, index, args)) == "OK";
+            return ExecuteScalar(key, "LSet", (c, k) => c.Value.LSet(k, index, args)) == "OK";
         }
         /// <summary>
         /// 对一个列表进行修剪，让列表只保留指定区间内的元素，不在指定区间之内的元素都将被删除
@@ -3008,20 +3071,20 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="stop">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public bool LTrim(string key, long start, long stop) => ExecuteScalar(key, (c, k) => c.Value.LTrim(k, start, stop)) == "OK";
+        public bool LTrim(string key, long start, long stop) => ExecuteScalar(key, "LTrim", (c, k) => c.Value.LTrim(k, start, stop)) == "OK";
         /// <summary>
         /// 移除并获取列表最后一个元素
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string RPop(string key) => ExecuteScalar(key, (c, k) => c.Value.RPop(k));
+        public string RPop(string key) => ExecuteScalar(key, "RPop", (c, k) => c.Value.RPop(k));
         /// <summary>
         /// 移除并获取列表最后一个元素
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public T RPop<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.RPopBytes(k)));
+        public T RPop<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "RPop", (c, k) => c.Value.RPopBytes(k)));
         /// <summary>
         /// 将列表 source 中的最后一个元素(尾元素)弹出，并返回给客户端。
         /// 将 source 弹出的元素插入到列表 destination ，作为 destination 列表的的头元素。
@@ -3049,7 +3112,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (value == null || value.Any() == false) return 0;
             var args = value.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.RPush(k, args));
+            return ExecuteScalar(key, "RPush<T>", (c, k) => c.Value.RPush(k, args));
         }
         /// <summary>
         /// 为已存在的列表添加值
@@ -3060,7 +3123,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long RPushX(string key, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.RPushX(k, args));
+            return ExecuteScalar(key, "RPushX", (c, k) => c.Value.RPushX(k, args));
         }
         #endregion
 
@@ -3071,28 +3134,28 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="field">字段</param>
         /// <returns></returns>
-        public long HStrLen(string key, string field) => ExecuteScalar(key, (c, k) => c.Value.HStrLen(k, field));
+        public long HStrLen(string key, string field) => ExecuteScalar(key, "HStrLen",(c, k) => c.Value.HStrLen(k, field));
         /// <summary>
         /// 删除一个或多个哈希表字段
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="fields">字段</param>
         /// <returns></returns>
-        public long HDel(string key, params string[] fields) => fields == null || fields.Any() == false ? 0 : ExecuteScalar(key, (c, k) => c.Value.HDel(k, fields));
+        public long HDel(string key, params string[] fields) => fields == null || fields.Any() == false ? 0 : ExecuteScalar(key, "HDel",(c, k) => c.Value.HDel(k, fields));
         /// <summary>
         /// 查看哈希表 key 中，指定的字段是否存在
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="field">字段</param>
         /// <returns></returns>
-        public bool HExists(string key, string field) => ExecuteScalar(key, (c, k) => c.Value.HExists(k, field));
+        public bool HExists(string key, string field) => ExecuteScalar(key, "HExists", (c, k) => c.Value.HExists(k, field));
         /// <summary>
         /// 获取存储在哈希表中指定字段的值
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="field">字段</param>
         /// <returns></returns>
-        public string HGet(string key, string field) => ExecuteScalar(key, (c, k) => c.Value.HGet(k, field));
+        public string HGet(string key, string field) => ExecuteScalar(key, "HGet", (c, k) => c.Value.HGet(k, field));
         /// <summary>
         /// 获取存储在哈希表中指定字段的值
         /// </summary>
@@ -3100,20 +3163,20 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="field">字段</param>
         /// <returns></returns>
-        public T HGet<T>(string key, string field) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.HGetBytes(k, field)));
+        public T HGet<T>(string key, string field) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "HGet", (c, k) => c.Value.HGetBytes(k, field)));
         /// <summary>
         /// 获取在哈希表中指定 key 的所有字段和值
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public Dictionary<string, string> HGetAll(string key) => ExecuteScalar(key, (c, k) => c.Value.HGetAll(k));
+        public Dictionary<string, string> HGetAll(string key) => ExecuteScalar(key, "HGetAll",(c, k) => c.Value.HGetAll(k));
         /// <summary>
         /// 获取在哈希表中指定 key 的所有字段和值
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public Dictionary<string, T> HGetAll<T>(string key) => this.DeserializeRedisValueDictionaryInternal<string, T>(ExecuteScalar(key, (c, k) => c.Value.HGetAllBytes(k)));
+        public Dictionary<string, T> HGetAll<T>(string key) => this.DeserializeRedisValueDictionaryInternal<string, T>(ExecuteScalar(key, "HGetAll", (c, k) => c.Value.HGetAllBytes(k)));
         /// <summary>
         /// 为哈希表 key 中的指定字段的整数值加上增量 increment
         /// </summary>
@@ -3121,7 +3184,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="field">字段</param>
         /// <param name="value">增量值(默认=1)</param>
         /// <returns></returns>
-        public long HIncrBy(string key, string field, long value = 1) => ExecuteScalar(key, (c, k) => c.Value.HIncrBy(k, field, value));
+        public long HIncrBy(string key, string field, long value = 1) => ExecuteScalar(key, "HIncrBy", (c, k) => c.Value.HIncrBy(k, field, value));
         /// <summary>
         /// 为哈希表 key 中的指定字段的整数值加上增量 increment
         /// </summary>
@@ -3129,26 +3192,26 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="field">字段</param>
         /// <param name="value">增量值(默认=1)</param>
         /// <returns></returns>
-        public decimal HIncrByFloat(string key, string field, decimal value) => ExecuteScalar(key, (c, k) => c.Value.HIncrByFloat(k, field, value));
+        public decimal HIncrByFloat(string key, string field, decimal value) => ExecuteScalar(key, "HIncrByFloat", (c, k) => c.Value.HIncrByFloat(k, field, value));
         /// <summary>
         /// 获取所有哈希表中的字段
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string[] HKeys(string key) => ExecuteScalar(key, (c, k) => c.Value.HKeys(k));
+        public string[] HKeys(string key) => ExecuteScalar(key, "HKeys", (c, k) => c.Value.HKeys(k));
         /// <summary>
         /// 获取哈希表中字段的数量
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long HLen(string key) => ExecuteScalar(key, (c, k) => c.Value.HLen(k));
+        public long HLen(string key) => ExecuteScalar(key, "HLen", (c, k) => c.Value.HLen(k));
         /// <summary>
         /// 获取存储在哈希表中多个字段的值
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="fields">字段</param>
         /// <returns></returns>
-        public string[] HMGet(string key, params string[] fields) => fields == null || fields.Any() == false ? new string[0] : ExecuteScalar(key, (c, k) => c.Value.HMGet(k, fields));
+        public string[] HMGet(string key, params string[] fields) => fields == null || fields.Any() == false ? new string[0] : ExecuteScalar(key, "HMGet", (c, k) => c.Value.HMGet(k, fields));
         /// <summary>
         /// 获取存储在哈希表中多个字段的值
         /// </summary>
@@ -3156,7 +3219,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="fields">一个或多个字段</param>
         /// <returns></returns>
-        public T[] HMGet<T>(string key, params string[] fields) => fields == null || fields.Any() == false ? new T[0] : this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.HMGetBytes(k, fields)));
+        public T[] HMGet<T>(string key, params string[] fields) => fields == null || fields.Any() == false ? new T[0] : this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "HMGet", (c, k) => c.Value.HMGetBytes(k, fields)));
         /// <summary>
         /// 同时将多个 field-value (域-值)对设置到哈希表 key 中
         /// </summary>
@@ -3176,7 +3239,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
                 parms.Add(k);
                 parms.Add(this.SerializeRedisValueInternal(v));
             }
-            return ExecuteScalar(key, (c, k) => c.Value.HMSet(k, parms.ToArray())) == "OK";
+            return ExecuteScalar(key, "HMSet", (c, k) => c.Value.HMSet(k, parms.ToArray())) == "OK";
         }
         /// <summary>
         /// 将哈希表 key 中的字段 field 的值设为 value
@@ -3188,7 +3251,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public bool HSet(string key, string field, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.HSet(k, field, args));
+            return ExecuteScalar(key, "HSet",(c, k) => c.Value.HSet(k, field, args));
         }
         /// <summary>
         /// 只有在字段 field 不存在时，设置哈希表字段的值
@@ -3200,21 +3263,21 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public bool HSetNx(string key, string field, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.HSetNx(k, field, args));
+            return ExecuteScalar(key, "HSetNx", (c, k) => c.Value.HSetNx(k, field, args));
         }
         /// <summary>
         /// 获取哈希表中所有值
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string[] HVals(string key) => ExecuteScalar(key, (c, k) => c.Value.HVals(k));
+        public string[] HVals(string key) => ExecuteScalar(key, "HVals",(c, k) => c.Value.HVals(k));
         /// <summary>
         /// 获取哈希表中所有值
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public T[] HVals<T>(string key) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.HValsBytes(k)));
+        public T[] HVals<T>(string key) => this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "HVals", (c, k) => c.Value.HValsBytes(k)));
         /// <summary>
         /// 迭代哈希表中的键值对
         /// </summary>
@@ -3225,7 +3288,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <returns></returns>
         public RedisScan<(string field, string value)> HScan(string key, long cursor, string pattern = null, long? count = null)
         {
-            var scan = ExecuteScalar(key, (c, k) => c.Value.HScan(k, cursor, pattern, count));
+            var scan = ExecuteScalar(key, "HScan", (c, k) => c.Value.HScan(k, cursor, pattern, count));
             return new RedisScan<(string, string)>(scan.Cursor, scan.Items.Select(z => (z.Item1, z.Item2)).ToArray());
         }
         /// <summary>
@@ -3239,7 +3302,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <returns></returns>
         public RedisScan<(string field, T value)> HScan<T>(string key, long cursor, string pattern = null, long? count = null)
         {
-            var scan = ExecuteScalar(key, (c, k) => c.Value.HScanBytes(k, cursor, pattern, count));
+            var scan = ExecuteScalar(key, "HScan", (c, k) => c.Value.HScanBytes(k, cursor, pattern, count));
             return new RedisScan<(string, T)>(scan.Cursor, scan.Items.Select(z => (z.Item1, this.DeserializeRedisValueInternal<T>(z.Item2))).ToArray());
         }
         #endregion
@@ -3254,7 +3317,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long Append(string key, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.Append(k, args));
+            return ExecuteScalar(key, "Append", (c, k) => c.Value.Append(k, args));
         }
         /// <summary>
         /// 计算给定位置被设置为 1 的比特位的数量
@@ -3263,7 +3326,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置</param>
         /// <param name="end">结束位置</param>
         /// <returns></returns>
-        public long BitCount(string key, long start, long end) => ExecuteScalar(key, (c, k) => c.Value.BitCount(k, start, end));
+        public long BitCount(string key, long start, long end) => ExecuteScalar(key, "BitCount", (c, k) => c.Value.BitCount(k, start, end));
         /// <summary>
         /// 对一个或多个保存二进制位的字符串 key 进行位元操作，并将结果保存到 destkey 上
         /// </summary>
@@ -3285,20 +3348,20 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，-1是最后一个，-2是倒数第二个</param>
         /// <param name="end">结果位置，-1是最后一个，-2是倒数第二个</param>
         /// <returns>返回范围内第一个被设置为1或者0的bit位</returns>
-        public long BitPos(string key, bool bit, long? start = null, long? end = null) => ExecuteScalar(key, (c, k) => c.Value.BitPos(k, bit, start, end));
+        public long BitPos(string key, bool bit, long? start = null, long? end = null) => ExecuteScalar(key, "BitPos", (c, k) => c.Value.BitPos(k, bit, start, end));
         /// <summary>
         /// 获取指定 key 的值
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string Get(string key) => ExecuteScalar(key, (c, k) => c.Value.Get(k));
+        public string Get(string key) => ExecuteScalar(key, "Get", (c, k) => c.Value.Get(k));
         /// <summary>
         /// 获取指定 key 的值
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public T Get<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.GetBytes(k)));
+        public T Get<T>(string key) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "Get", (c, k) => c.Value.GetBytes(k)));
         /// <summary>
         /// 获取指定 key 的值（适用大对象返回）
         /// </summary>
@@ -3307,7 +3370,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="bufferSize">读取缓冲区</param>
         public void Get(string key, Stream destination, int bufferSize = 1024)
         {
-            ExecuteScalar(key, (c, k) =>
+            ExecuteScalar(key, "Get", (c, k) =>
             {
                 c.Value.WriteNoneRead(new Internal.Commands.RedisString("GET", k));
                 c.Value._reader.ReadBulkBytes(destination, bufferSize, true);
@@ -3320,7 +3383,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="offset">偏移量</param>
         /// <returns></returns>
-        public bool GetBit(string key, uint offset) => ExecuteScalar(key, (c, k) => c.Value.GetBit(k, offset));
+        public bool GetBit(string key, uint offset) => ExecuteScalar(key, "GetBit", (c, k) => c.Value.GetBit(k, offset));
         /// <summary>
         /// 返回 key 中字符串值的子字符
         /// </summary>
@@ -3328,7 +3391,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="end">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public string GetRange(string key, long start, long end) => ExecuteScalar(key, (c, k) => c.Value.GetRange(k, start, end));
+        public string GetRange(string key, long start, long end) => ExecuteScalar(key, "GetRange", (c, k) => c.Value.GetRange(k, start, end));
         /// <summary>
         /// 返回 key 中字符串值的子字符
         /// </summary>
@@ -3337,7 +3400,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="start">开始位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <param name="end">结束位置，0表示第一个元素，-1表示最后一个元素</param>
         /// <returns></returns>
-        public T GetRange<T>(string key, long start, long end) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.GetRangeBytes(k, start, end)));
+        public T GetRange<T>(string key, long start, long end) => this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "GetRange", (c, k) => c.Value.GetRangeBytes(k, start, end)));
         /// <summary>
         /// 将给定 key 的值设为 value ，并返回 key 的旧值(old value)
         /// </summary>
@@ -3347,7 +3410,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public string GetSet(string key, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.GetSet(k, args));
+            return ExecuteScalar(key, "GetSet", (c, k) => c.Value.GetSet(k, args));
         }
         /// <summary>
         /// 将给定 key 的值设为 value ，并返回 key 的旧值(old value)
@@ -3359,7 +3422,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public T GetSet<T>(string key, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, (c, k) => c.Value.GetSetBytes(k, args)));
+            return this.DeserializeRedisValueInternal<T>(ExecuteScalar(key, "GetSet", (c, k) => c.Value.GetSetBytes(k, args)));
         }
         /// <summary>
         /// 将 key 所储存的值加上给定的增量值（increment）
@@ -3367,27 +3430,27 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="value">增量值(默认=1)</param>
         /// <returns></returns>
-        public long IncrBy(string key, long value = 1) => ExecuteScalar(key, (c, k) => c.Value.IncrBy(k, value));
+        public long IncrBy(string key, long value = 1) => ExecuteScalar(key, "IncrBy", (c, k) => c.Value.IncrBy(k, value));
         /// <summary>
         /// 将 key 所储存的值加上给定的浮点增量值（increment）
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="value">增量值(默认=1)</param>
         /// <returns></returns>
-        public decimal IncrByFloat(string key, decimal value) => ExecuteScalar(key, (c, k) => c.Value.IncrByFloat(k, value));
+        public decimal IncrByFloat(string key, decimal value) => ExecuteScalar(key, "IncrByFloat", (c, k) => c.Value.IncrByFloat(k, value));
         /// <summary>
         /// 获取多个指定 key 的值(数组)
         /// </summary>
         /// <param name="keys">不含prefix前辍</param>
         /// <returns></returns>
-        public string[] MGet(params string[] keys) => ExecuteArray(keys, (c, k) => c.Value.MGet(k));
+        public string[] MGet(params string[] keys) => ExecuteArray(keys, "MGet", (c, k) => c.Value.MGet(k));
         /// <summary>
         /// 获取多个指定 key 的值(数组)
         /// </summary>
         /// <typeparam name="T">byte[] 或其他类型</typeparam>
         /// <param name="keys">不含prefix前辍</param>
         /// <returns></returns>
-        public T[] MGet<T>(params string[] keys) => this.DeserializeRedisValueArrayInternal<T>(ExecuteArray(keys, (c, k) => c.Value.MGetBytes(k)));
+        public T[] MGet<T>(params string[] keys) => this.DeserializeRedisValueArrayInternal<T>(ExecuteArray(keys, "MGet<T>", (c, k) => c.Value.MGetBytes(k)));
         /// <summary>
         /// 同时设置一个或多个 key-value 对
         /// </summary>
@@ -3426,7 +3489,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
                 return c.Value.MSet(parms) == "OK" ? 1 : 0;
             };
             if (exists == RedisExistence.Nx) return NodesNotSupport(dic.Keys.ToArray(), 0, handle) > 0;
-            return ExecuteNonQuery(dic.Keys.ToArray(), handle) > 0;
+            return ExecuteNonQuery(dic.Keys.ToArray(), "MSetInternal", handle) > 0;
         }
         /// <summary>
         /// 设置指定 key 的值，所有写入参数object都支持string | byte[] | 数值 | 对象
@@ -3439,19 +3502,19 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public bool Set(string key, object value, int expireSeconds = -1, RedisExistence? exists = null)
         {
             object redisValule = this.SerializeRedisValueInternal(value);
-            if (expireSeconds <= 0 && exists == null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule)) == "OK";
-            if (expireSeconds <= 0 && exists != null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule, null, exists)) == "OK";
-            if (expireSeconds > 0 && exists == null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule, expireSeconds, null)) == "OK";
-            if (expireSeconds > 0 && exists != null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule, expireSeconds, exists)) == "OK";
+            if (expireSeconds <= 0 && exists == null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule)) == "OK";
+            if (expireSeconds <= 0 && exists != null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule, null, exists)) == "OK";
+            if (expireSeconds > 0 && exists == null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule, expireSeconds, null)) == "OK";
+            if (expireSeconds > 0 && exists != null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule, expireSeconds, exists)) == "OK";
             return false;
         }
         public bool Set(string key, object value, TimeSpan expire, RedisExistence? exists = null)
         {
             object redisValule = this.SerializeRedisValueInternal(value);
-            if (expire <= TimeSpan.Zero && exists == null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule)) == "OK";
-            if (expire <= TimeSpan.Zero && exists != null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule, null, exists)) == "OK";
-            if (expire > TimeSpan.Zero && exists == null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule, expire, null)) == "OK";
-            if (expire > TimeSpan.Zero && exists != null) return ExecuteScalar(key, (c, k) => c.Value.Set(k, redisValule, expire, exists)) == "OK";
+            if (expire <= TimeSpan.Zero && exists == null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule)) == "OK";
+            if (expire <= TimeSpan.Zero && exists != null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule, null, exists)) == "OK";
+            if (expire > TimeSpan.Zero && exists == null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule, expire, null)) == "OK";
+            if (expire > TimeSpan.Zero && exists != null) return ExecuteScalar(key, "Set", (c, k) => c.Value.Set(k, redisValule, expire, exists)) == "OK";
             return false;
         }
         /// <summary>
@@ -3461,7 +3524,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="offset">偏移量</param>
         /// <param name="value">值</param>
         /// <returns></returns>
-        public bool SetBit(string key, uint offset, bool value) => ExecuteScalar(key, (c, k) => c.Value.SetBit(k, offset, value));
+        public bool SetBit(string key, uint offset, bool value) => ExecuteScalar(key, "SetBit", (c, k) => c.Value.SetBit(k, offset, value));
         /// <summary>
         /// 只有在 key 不存在时设置 key 的值
         /// </summary>
@@ -3471,7 +3534,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public bool SetNx(string key, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.SetNx(k, args));
+            return ExecuteScalar(key, "SetNx", (c, k) => c.Value.SetNx(k, args));
         }
         /// <summary>
         /// 用 value 参数覆写给定 key 所储存的字符串值，从偏移量 offset 开始
@@ -3483,14 +3546,14 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         public long SetRange(string key, uint offset, object value)
         {
             var args = this.SerializeRedisValueInternal(value);
-            return ExecuteScalar(key, (c, k) => c.Value.SetRange(k, offset, args));
+            return ExecuteScalar(key, "SetRange", (c, k) => c.Value.SetRange(k, offset, args));
         }
         /// <summary>
         /// 返回 key 所储存的字符串值的长度
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long StrLen(string key) => ExecuteScalar(key, (c, k) => c.Value.StrLen(k));
+        public long StrLen(string key) => ExecuteScalar(key, "StrLen", (c, k) => c.Value.StrLen(k));
         #endregion
 
         #region Key
@@ -3499,31 +3562,31 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long Touch(params string[] key) => ExecuteNonQuery(key, (c, k) => c.Value.Touch(k));
+        public long Touch(params string[] key) => ExecuteNonQuery(key, "Touch", (c, k) => c.Value.Touch(k));
         /// <summary>
         /// [redis-server 4.0.0] Delete a key, 该命令和DEL十分相似：删除指定的key(s),若key不存在则该key被跳过。但是，相比DEL会产生阻塞，该命令会在另一个线程中回收内存，因此它是非阻塞的。 这也是该命令名字的由来：仅将keys从keyspace元数据中删除，真正的删除会在后续异步操作。
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long UnLink(params string[] key) => ExecuteNonQuery(key, (c, k) => c.Value.UnLink(k));
+        public long UnLink(params string[] key) => ExecuteNonQuery(key, "UnLink", (c, k) => c.Value.UnLink(k));
         /// <summary>
         /// 用于在 key 存在时删除 key
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long Del(params string[] key) => ExecuteNonQuery(key, (c, k) => c.Value.Del(k));
+        public long Del(params string[] key) => ExecuteNonQuery(key, "Del", (c, k) => c.Value.Del(k));
         /// <summary>
         /// 序列化给定 key ，并返回被序列化的值
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public byte[] Dump(string key) => ExecuteScalar(key, (c, k) => c.Value.Dump(k));
+        public byte[] Dump(string key) => ExecuteScalar(key, "Dump", (c, k) => c.Value.Dump(k));
         /// <summary>
         /// 检查给定 key 是否存在
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public bool Exists(string key) => ExecuteScalar(key, (c, k) => c.Value.Exists(k));
+        public bool Exists(string key) => ExecuteScalar(key, "Exists", (c, k) => c.Value.Exists(k));
         /// <summary>
 		/// [redis-server 3.0] 检查给定多个 key 是否存在
 		/// </summary>
@@ -3536,21 +3599,21 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="seconds">过期秒数</param>
         /// <returns></returns>
-        public bool Expire(string key, int seconds) => ExecuteScalar(key, (c, k) => c.Value.Expire(k, seconds));
+        public bool Expire(string key, int seconds) => ExecuteScalar(key, "Expire", (c, k) => c.Value.Expire(k, seconds));
         /// <summary>
         /// 为给定 key 设置过期时间
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="expire">过期时间</param>
         /// <returns></returns>
-        public bool Expire(string key, TimeSpan expire) => ExecuteScalar(key, (c, k) => c.Value.Expire(k, expire));
+        public bool Expire(string key, TimeSpan expire) => ExecuteScalar(key, "Expire", (c, k) => c.Value.Expire(k, expire));
         /// <summary>
         /// 为给定 key 设置过期时间
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="expire">过期时间</param>
         /// <returns></returns>
-        public bool ExpireAt(string key, DateTime expire) => ExecuteScalar(key, (c, k) => c.Value.ExpireAt(k, expire));
+        public bool ExpireAt(string key, DateTime expire) => ExecuteScalar(key, "ExpireAt", (c, k) => c.Value.ExpireAt(k, expire));
         /// <summary>
         /// 查找所有分区节点中符合给定模式(pattern)的 key
         /// </summary>
@@ -3569,58 +3632,58 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="database">数据库</param>
         /// <returns></returns>
-        public bool Move(string key, int database) => ExecuteScalar(key, (c, k) => c.Value.Move(k, database));
+        public bool Move(string key, int database) => ExecuteScalar(key, "Move", (c, k) => c.Value.Move(k, database));
         /// <summary>
         /// 该返回给定 key 锁储存的值所使用的内部表示(representation)
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public string ObjectEncoding(string key) => ExecuteScalar(key, (c, k) => c.Value.ObjectEncoding(k));
+        public string ObjectEncoding(string key) => ExecuteScalar(key, "ObjectEncoding", (c, k) => c.Value.ObjectEncoding(k));
         /// <summary>
         /// 该返回给定 key 引用所储存的值的次数。此命令主要用于除错
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long? ObjectRefCount(string key) => ExecuteScalar(key, (c, k) => c.Value.Object(RedisObjectSubCommand.RefCount, k));
+        public long? ObjectRefCount(string key) => ExecuteScalar(key, "ObjectRefCount", (c, k) => c.Value.Object(RedisObjectSubCommand.RefCount, k));
         /// <summary>
         /// 返回给定 key 自储存以来的空转时间(idle， 没有被读取也没有被写入)，以秒为单位
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long? ObjectIdleTime(string key) => ExecuteScalar(key, (c, k) => c.Value.Object(RedisObjectSubCommand.IdleTime, k));
+        public long? ObjectIdleTime(string key) => ExecuteScalar(key, "ObjectIdleTime", (c, k) => c.Value.Object(RedisObjectSubCommand.IdleTime, k));
         /// <summary>
         /// 移除 key 的过期时间，key 将持久保持
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public bool Persist(string key) => ExecuteScalar(key, (c, k) => c.Value.Persist(k));
+        public bool Persist(string key) => ExecuteScalar(key, "Persist", (c, k) => c.Value.Persist(k));
         /// <summary>
         /// 为给定 key 设置过期时间（毫秒）
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="milliseconds">过期毫秒数</param>
         /// <returns></returns>
-        public bool PExpire(string key, int milliseconds) => ExecuteScalar(key, (c, k) => c.Value.PExpire(k, milliseconds));
+        public bool PExpire(string key, int milliseconds) => ExecuteScalar(key, "PExpire", (c, k) => c.Value.PExpire(k, milliseconds));
         /// <summary>
         /// 为给定 key 设置过期时间（毫秒）
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="expire">过期时间</param>
         /// <returns></returns>
-        public bool PExpire(string key, TimeSpan expire) => ExecuteScalar(key, (c, k) => c.Value.PExpire(k, expire));
+        public bool PExpire(string key, TimeSpan expire) => ExecuteScalar(key, "PExpire", (c, k) => c.Value.PExpire(k, expire));
         /// <summary>
         /// 为给定 key 设置过期时间（毫秒）
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="expire">过期时间</param>
         /// <returns></returns>
-        public bool PExpireAt(string key, DateTime expire) => ExecuteScalar(key, (c, k) => c.Value.PExpireAt(k, expire));
+        public bool PExpireAt(string key, DateTime expire) => ExecuteScalar(key, "PExpireAt", (c, k) => c.Value.PExpireAt(k, expire));
         /// <summary>
         /// 以毫秒为单位返回 key 的剩余的过期时间
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long PTtl(string key) => ExecuteScalar(key, (c, k) => c.Value.PTtl(k));
+        public long PTtl(string key) => ExecuteScalar(key, "PTtl", (c, k) => c.Value.PTtl(k));
         /// <summary>
         /// 从所有节点中随机返回一个 key
         /// </summary>
@@ -3672,7 +3735,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="serializedValue">序列化值</param>
         /// <returns></returns>
-        public bool Restore(string key, byte[] serializedValue) => ExecuteScalar(key, (c, k) => c.Value.Restore(k, 0, serializedValue)) == "OK";
+        public bool Restore(string key, byte[] serializedValue) => ExecuteScalar(key, "Restore", (c, k) => c.Value.Restore(k, 0, serializedValue)) == "OK";
         /// <summary>
         /// 反序列化给定的序列化值，并将它和给定的 key 关联
         /// </summary>
@@ -3680,7 +3743,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="ttlMilliseconds">毫秒为单位为 key 设置生存时间</param>
         /// <param name="serializedValue">序列化值</param>
         /// <returns></returns>
-        public bool Restore(string key, long ttlMilliseconds, byte[] serializedValue) => ExecuteScalar(key, (c, k) => c.Value.Restore(k, ttlMilliseconds, serializedValue)) == "OK";
+        public bool Restore(string key, long ttlMilliseconds, byte[] serializedValue) => ExecuteScalar(key, "Restore", (c, k) => c.Value.Restore(k, ttlMilliseconds, serializedValue)) == "OK";
         /// <summary>
         /// 返回给定列表、集合、有序集合 key 中经过排序的元素，参数资料：http://doc.redisfans.com/key/sort.html
         /// </summary>
@@ -3693,7 +3756,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="get">根据排序的结果来取出相应的键值</param>
         /// <returns></returns>
         public string[] Sort(string key, long? count = null, long offset = 0, string by = null, RedisSortDir? dir = null, bool? isAlpha = null, params string[] get) =>
-            NodesNotSupport(key, (c, k) => c.Value.Sort(k, offset, count, by, dir, isAlpha, get));
+            NodesNotSupport(key, "Sort", (c, k) => c.Value.Sort(k, offset, count, by, dir, isAlpha, get));
         /// <summary>
         /// 保存给定列表、集合、有序集合 key 中经过排序的元素，参数资料：http://doc.redisfans.com/key/sort.html
         /// </summary>
@@ -3707,19 +3770,19 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="get">根据排序的结果来取出相应的键值</param>
         /// <returns></returns>
         public long SortAndStore(string key, string destination, long? count = null, long offset = 0, string by = null, RedisSortDir? dir = null, bool? isAlpha = null, params string[] get) =>
-            NodesNotSupport(key, (c, k) => c.Value.SortAndStore(k, (c.Pool as RedisClientPool)?.Prefix + destination, offset, count, by, dir, isAlpha, get));
+            NodesNotSupport(key, "SortAndStore", (c, k) => c.Value.SortAndStore(k, (c.Pool as RedisClientPool)?.Prefix + destination, offset, count, by, dir, isAlpha, get));
         /// <summary>
         /// 以秒为单位，返回给定 key 的剩余生存时间
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long Ttl(string key) => ExecuteScalar(key, (c, k) => c.Value.Ttl(k));
+        public long Ttl(string key) => ExecuteScalar(key, "Ttl", (c, k) => c.Value.Ttl(k));
         /// <summary>
         /// 返回 key 所储存的值的类型
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public KeyType Type(string key) => Enum.TryParse(ExecuteScalar(key, (c, k) => c.Value.Type(k)), true, out KeyType tryenum) ? tryenum : KeyType.None;
+        public KeyType Type(string key) => Enum.TryParse(ExecuteScalar(key, "Type", (c, k) => c.Value.Type(k)), true, out KeyType tryenum) ? tryenum : KeyType.None;
         /// <summary>
         /// 迭代当前数据库中的数据库键
         /// </summary>
@@ -3727,7 +3790,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="pattern">模式</param>
         /// <param name="count">数量</param>
         /// <returns></returns>
-        public RedisScan<string> Scan(long cursor, string pattern = null, long? count = null) => NodesNotSupport("Scan", (c, k) => c.Value.Scan(cursor, pattern, count));
+        public RedisScan<string> Scan(long cursor, string pattern = null, long? count = null) => NodesNotSupport("Scan", "Scan", (c, k) => c.Value.Scan(cursor, pattern, count));
         /// <summary>
         /// 迭代当前数据库中的数据库键
         /// </summary>
@@ -3738,7 +3801,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <returns></returns>
         public RedisScan<T> Scan<T>(long cursor, string pattern = null, long? count = null)
         {
-            var scan = NodesNotSupport("Scan<T>", (c, k) => c.Value.ScanBytes(cursor, pattern, count));
+            var scan = NodesNotSupport("Scan<T>", "Scan<T>", (c, k) => c.Value.ScanBytes(cursor, pattern, count));
             return new RedisScan<T>(scan.Cursor, this.DeserializeRedisValueArrayInternal<T>(scan.Items));
         }
         #endregion
@@ -3763,7 +3826,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (values == null || values.Any() == false) return 0;
             var args = values.Select(z => (z.longitude, z.latitude, this.SerializeRedisValueInternal(z.member))).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.GeoAdd(k, args));
+            return ExecuteScalar(key, "GeoAdd", (c, k) => c.Value.GeoAdd(k, args));
         }
         /// <summary>
         /// 返回两个给定位置之间的距离。如果两个位置之间的其中一个不存在， 那么命令返回空值。GEODIST 命令在计算距离时会假设地球为完美的球形， 在极限情况下， 这一假设最大会造成 0.5% 的误差。
@@ -3777,7 +3840,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             var args1 = this.SerializeRedisValueInternal(member1);
             var args2 = this.SerializeRedisValueInternal(member2);
-            return ExecuteScalar(key, (c, k) => c.Value.GeoDist(k, args1, args2, unit));
+            return ExecuteScalar(key, "GeoDist", (c, k) => c.Value.GeoDist(k, args1, args2, unit));
         }
         /// <summary>
         /// 返回一个或多个位置元素的 Geohash 表示。通常使用表示位置的元素使用不同的技术，使用Geohash位置52点整数编码。由于编码和解码过程中所使用的初始最小和最大坐标不同，编码的编码也不同于标准。
@@ -3789,7 +3852,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (members == null || members.Any() == false) return new string[0];
             var args = members.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.GeoHash(k, args));
+            return ExecuteScalar(key, "GeoHash", (c, k) => c.Value.GeoHash(k, args));
         }
         /// <summary>
         /// 从key里返回所有给定位置元素的位置（经度和纬度）。
@@ -3801,7 +3864,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         {
             if (members == null || members.Any() == false) return new (decimal, decimal)?[0];
             var args = members.Select(z => this.SerializeRedisValueInternal(z)).ToArray();
-            return ExecuteScalar(key, (c, k) => c.Value.GeoPos(k, args));
+            return ExecuteScalar(key, "GeoPos", (c, k) => c.Value.GeoPos(k, args));
         }
 
         /// <summary>
@@ -3816,7 +3879,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public string[] GeoRadius(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, false, false, false)).Select(a => a.member).ToArray();
+            ExecuteScalar(key, "GeoRadius", (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, false, false, false)).Select(a => a.member).ToArray();
         /// <summary>
         /// 以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素。
         /// </summary>
@@ -3829,7 +3892,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public T[] GeoRadius<T>(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, false, false, false)).Select(a => this.DeserializeRedisValueInternal<T>(a.member)).ToArray();
+            ExecuteScalar(key, "GeoRadius", (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, false, false, false)).Select(a => this.DeserializeRedisValueInternal<T>(a.member)).ToArray();
 
         /// <summary>
         /// 以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离）。
@@ -3843,7 +3906,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (string member, decimal dist)[] GeoRadiusWithDist(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, false, true, false)).Select(a => (a.member, a.dist)).ToArray();
+            ExecuteScalar(key, "GeoRadiusWithDist", (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, false, true, false)).Select(a => (a.member, a.dist)).ToArray();
         /// <summary>
         /// 以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离）。
         /// </summary>
@@ -3856,7 +3919,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (T member, decimal dist)[] GeoRadiusWithDist<T>(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, false, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist)).ToArray();
+            ExecuteScalar(key, "GeoRadiusWithDist", (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, false, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist)).ToArray();
 
         /// <summary>
         /// 以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含经度、纬度）。
@@ -3870,7 +3933,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         private (string member, decimal longitude, decimal latitude)[] GeoRadiusWithCoord(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, true, false, false)).Select(a => (a.member, a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusWithCoord", (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, true, false, false)).Select(a => (a.member, a.longitude, a.latitude)).ToArray();
         /// <summary>
         /// 以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含经度、纬度）。
         /// </summary>
@@ -3883,7 +3946,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         private (T member, decimal longitude, decimal latitude)[] GeoRadiusWithCoord<T>(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, true, false, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusWithCoord", (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, true, false, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.longitude, a.latitude)).ToArray();
 
         /// <summary>
         /// 以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离、经度、纬度）。
@@ -3897,7 +3960,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (string member, decimal dist, decimal longitude, decimal latitude)[] GeoRadiusWithDistAndCoord(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, true, true, false)).Select(a => (a.member, a.dist, a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusWithDistAndCoord", (c, k) => c.Value.GeoRadius(k, longitude, latitude, radius, unit, count, sorting, true, true, false)).Select(a => (a.member, a.dist, a.longitude, a.latitude)).ToArray();
         /// <summary>
         /// 以给定的经纬度为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离、经度、纬度）。
         /// </summary>
@@ -3910,7 +3973,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (T member, decimal dist, decimal longitude, decimal latitude)[] GeoRadiusWithDistAndCoord<T>(string key, decimal longitude, decimal latitude, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, true, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist, a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusWithDistAndCoord", (c, k) => c.Value.GeoRadiusBytes(k, longitude, latitude, radius, unit, count, sorting, true, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist, a.longitude, a.latitude)).ToArray();
 
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素。
@@ -3923,7 +3986,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public string[] GeoRadiusByMember(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, false, false, false)).Select(a => a.member).ToArray();
+            ExecuteScalar(key, "GeoRadiusByMember", (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, false, false, false)).Select(a => a.member).ToArray();
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素。
         /// </summary>
@@ -3935,7 +3998,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public T[] GeoRadiusByMember<T>(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, false, false, false)).Select(a => a.member).ToArray());
+            this.DeserializeRedisValueArrayInternal<T>(ExecuteScalar(key, "GeoRadiusByMember", (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, false, false, false)).Select(a => a.member).ToArray());
 
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离）。
@@ -3948,7 +4011,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (string member, decimal dist)[] GeoRadiusByMemberWithDist(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, false, true, false)).Select(a => (a.member, a.dist)).ToArray();
+            ExecuteScalar(key, "GeoRadiusByMemberWithDist", (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, false, true, false)).Select(a => (a.member, a.dist)).ToArray();
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离）。
         /// </summary>
@@ -3960,7 +4023,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (T member, decimal dist)[] GeoRadiusByMemberWithDist<T>(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, false, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist)).ToArray();
+            ExecuteScalar(key, "GeoRadiusByMemberWithDist", (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, false, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist)).ToArray();
 
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含经度、纬度）。
@@ -3973,7 +4036,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         private (string member, decimal longitude, decimal latitude)[] GeoRadiusByMemberWithCoord(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, true, false, false)).Select(a => (a.member, a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusByMemberWithCoord", (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, true, false, false)).Select(a => (a.member, a.longitude, a.latitude)).ToArray();
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含经度、纬度）。
         /// </summary>
@@ -3985,7 +4048,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         private (T member, decimal longitude, decimal latitude)[] GeoRadiusByMemberWithCoord<T>(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, true, false, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusByMemberWithCoord", (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, true, false, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.longitude, a.latitude)).ToArray();
 
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离、经度、纬度）。
@@ -3998,7 +4061,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (string member, decimal dist, decimal longitude, decimal latitude)[] GeoRadiusByMemberWithDistAndCoord(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, true, true, false)).Select(a => (a.member, a.dist, a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusByMemberWithDistAndCoord", (c, k) => c.Value.GeoRadiusByMember(k, member, radius, unit, count, sorting, true, true, false)).Select(a => (a.member, a.dist, a.longitude, a.latitude)).ToArray();
         /// <summary>
         /// 以给定的成员为中心， 返回键包含的位置元素当中， 与中心的距离不超过给定最大距离的所有位置元素（包含距离、经度、纬度）。
         /// </summary>
@@ -4010,7 +4073,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="sorting">排序</param>
         /// <returns></returns>
         public (T member, decimal dist, decimal longitude, decimal latitude)[] GeoRadiusByMemberWithDistAndCoord<T>(string key, object member, decimal radius, GeoUnit unit = GeoUnit.m, long? count = null, GeoOrderBy? sorting = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, true, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist, a.longitude, a.latitude)).ToArray();
+            ExecuteScalar(key, "GeoRadiusByMemberWithDistAndCoord", (c, k) => c.Value.GeoRadiusBytesByMember(k, member, radius, unit, count, sorting, true, true, false)).Select(a => (this.DeserializeRedisValueInternal<T>(a.member), a.dist, a.longitude, a.latitude)).ToArray();
         #endregion
 
         #region Stream redis-server 5.0
@@ -4023,7 +4086,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="group">组</param>
         /// <param name="id">消息id</param>
         /// <returns></returns>
-        public long XAck(string key, string group, string id) => ExecuteScalar(key, (c, k) => c.Value.XAck(k, group, id));
+        public long XAck(string key, string group, string id) => ExecuteScalar(key, "XAck", (c, k) => c.Value.XAck(k, group, id));
 
         /// <summary>
         /// 将指定的流条目追加到指定key的流中。 如果key不存在，作为运行这个命令的副作用，将使用流的条目自动创建key。
@@ -4048,7 +4111,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="id">消息id，如果指定的id参数是字符*（星号ASCII字符），XADD命令会自动为您生成一个唯一的ID。 但是，也可以指定一个良好格式的ID，以便新的条目以指定的ID准确存储</param>
         /// <param name="fieldValues">键值对数组</param>
         /// <returns></returns>
-        public string XAdd(string key, long maxLen, string id = "*", params (string, string)[] fieldValues) => ExecuteScalar(key, (c, k) => c.Value.XAdd(k, maxLen, id, fieldValues));
+        public string XAdd(string key, long maxLen, string id = "*", params (string, string)[] fieldValues) => ExecuteScalar(key, "XAdd", (c, k) => c.Value.XAdd(k, maxLen, id, fieldValues));
 
         /// <summary>
         /// 在流的消费者组上下文中，此命令改变待处理消息的所有权
@@ -4060,7 +4123,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="id">消息id</param>
         /// <returns></returns>
         public (string id, string[] items)[] XClaim(string key, string group, string consumer, long minIdleTime, params string[] id) =>
-            ExecuteScalar(key, (c, k) => c.Value.XClaim(k, group, consumer, minIdleTime, id));
+            ExecuteScalar(key, "XClaim", (c, k) => c.Value.XClaim(k, group, consumer, minIdleTime, id));
         /// <summary>
         /// 在流的消费者组上下文中，此命令改变待处理消息的所有权
         /// </summary>
@@ -4074,7 +4137,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="force">在待处理条目列表（PEL）中创建待处理消息条目，即使某些指定的ID尚未在分配给不同客户端的待处理条目列表（PEL）中。但是消息必须存在于流中，否则不存在的消息ID将会被忽略。</param>
         /// <returns></returns>
         public (string id, string[] items)[] XClaim(string key, string group, string consumer, long minIdleTime, string[] id, long idle, long retryCount, bool force) =>
-            ExecuteScalar(key, (c, k) => c.Value.XClaim(k, group, consumer, minIdleTime, id, idle, retryCount, force));
+            ExecuteScalar(key, "XClaim", (c, k) => c.Value.XClaim(k, group, consumer, minIdleTime, id, idle, retryCount, force));
 
         /// <summary>
         /// 在流的消费者组上下文中，此命令改变待处理消息的所有权
@@ -4086,7 +4149,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="id">消息id</param>
         /// <returns>只返回消息id</returns>
         public string[] XClaimJustId(string key, string group, string consumer, long minIdleTime, params string[] id) =>
-            ExecuteScalar(key, (c, k) => c.Value.XClaimJustId(k, group, consumer, minIdleTime, id));
+            ExecuteScalar(key, "XClaimJustId", (c, k) => c.Value.XClaimJustId(k, group, consumer, minIdleTime, id));
         /// <summary>
         /// 在流的消费者组上下文中，此命令改变待处理消息的所有权
         /// </summary>
@@ -4100,7 +4163,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="force">在待处理条目列表（PEL）中创建待处理消息条目，即使某些指定的ID尚未在分配给不同客户端的待处理条目列表（PEL）中。但是消息必须存在于流中，否则不存在的消息ID将会被忽略。</param>
         /// <returns>只返回消息id</returns>
         public string[] XClaimJustId(string key, string group, string consumer, long minIdleTime, string[] id, long idle, long retryCount, bool force) =>
-            ExecuteScalar(key, (c, k) => c.Value.XClaimJustId(k, group, consumer, minIdleTime, id, idle, retryCount, force));
+            ExecuteScalar(key, "XClaimJustId", (c, k) => c.Value.XClaimJustId(k, group, consumer, minIdleTime, id, idle, retryCount, force));
 
         /// <summary>
         /// 从指定流中移除指定的条目，并返回成功删除的条目的数量，在传递的ID不存在的情况下， 返回的数量可能与传递的ID数量不同。
@@ -4108,7 +4171,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="id">消息id</param>
         /// <returns></returns>
-        public long XDel(string key, params string[] id) => ExecuteScalar(key, (c, k) => c.Value.XDel(k, id));
+        public long XDel(string key, params string[] id) => ExecuteScalar(key, "XDel", (c, k) => c.Value.XDel(k, id));
 
         /// <summary>
         /// 创建一个新的消费者组
@@ -4118,7 +4181,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="id">特殊的ID ‘$’（这表示：流中最后一项的ID）。在这种情况下，从该消费者组获取数据的消费者只能看到到达流的新元素。但如果你希望消费者组获取整个流的历史记录，使用0作为消费者组的开始ID。</param>
         /// <param name="MkStream">create the empty stream if it does not exist.</param>
         /// <returns>如果指定的消费者组已经存在，则该命令将返回-BUSYGROUP错误。</returns>
-        public string XGroupCreate(string key, string group, string id = "$", bool MkStream = false) => ExecuteScalar(key, (c, k) => c.Value.XGroupCreate(k, group, id, MkStream));
+        public string XGroupCreate(string key, string group, string id = "$", bool MkStream = false) => ExecuteScalar(key, "XGroupCreate", (c, k) => c.Value.XGroupCreate(k, group, id, MkStream));
         /// <summary>
         /// 设置要传递的下一条消息。 通常情况下，在消费者创建时设置下一个ID，作为XGROUP CREATE的最后一个参数。 但是使用这种形式，可以在以后修改下一个ID，而无需再次删除和创建使用者组。
         /// </summary>
@@ -4126,14 +4189,14 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="group">组名</param>
         /// <param name="id">特殊的ID ‘$’（这表示：流中最后一项的ID）。在这种情况下，从该消费者组获取数据的消费者只能看到到达流的新元素。但如果你希望消费者组获取整个流的历史记录，使用0作为消费者组的开始ID。</param>
         /// <returns></returns>
-        public string XGroupSetId(string key, string group, string id = "$") => ExecuteScalar(key, (c, k) => c.Value.XGroupSetId(k, group, id));
+        public string XGroupSetId(string key, string group, string id = "$") => ExecuteScalar(key, "XGroupSetId", (c, k) => c.Value.XGroupSetId(k, group, id));
         /// <summary>
         /// 销毁消费者组，即使存在活动的消费者和待处理消息，消费者组也将被销毁，因此请确保仅在真正需要时才调用此命令。
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <param name="group">组名</param>
         /// <returns></returns>
-        public bool XGroupDestroy(string key, string group) => ExecuteScalar(key, (c, k) => c.Value.XGroupDestroy(k, group));
+        public bool XGroupDestroy(string key, string group) => ExecuteScalar(key, "XGroupDestroy", (c, k) => c.Value.XGroupDestroy(k, group));
         /// <summary>
         /// 仅从消费者组中移除给定的消费者
         /// </summary>
@@ -4141,7 +4204,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="group">组名</param>
         /// <param name="consumer">消费者</param>
         /// <returns></returns>
-        public bool XGroupDelConsumer(string key, string group, string consumer) => ExecuteScalar(key, (c, k) => c.Value.XGroupDelConsumer(k, group, consumer));
+        public bool XGroupDelConsumer(string key, string group, string consumer) => ExecuteScalar(key, "XGroupDelConsumer", (c, k) => c.Value.XGroupDelConsumer(k, group, consumer));
 
         /// <summary>
         /// 返回有关存储在特定键的流的一般信息
@@ -4149,14 +4212,14 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
         public (long length, long radixTreeKeys, long radixTreeNodes, long groups, string lastGeneratedId, (string id, string[] items) firstEntry, (string id, string[] items) lastEntry) XInfoStream(string key) =>
-            ExecuteScalar(key, (c, k) => c.Value.XInfoStream(k));
+            ExecuteScalar(key, "XInfoStream", (c, k) => c.Value.XInfoStream(k));
         /// <summary>
         /// 获得与流关联的所有消费者组数据，该命令显示该组中已知的消费者数量，以及该组中的待处理消息（已传递但尚未确认）数量
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
         public (string name, long consumers, long pending, string lastDeliveredId)[] XInfoGroups(string key) =>
-            ExecuteScalar(key, (c, k) => c.Value.XInfoGroups(k));
+            ExecuteScalar(key, "XInfoGroups", (c, k) => c.Value.XInfoGroups(k));
         /// <summary>
         /// 取得指定消费者组中的消费者列表，返回每个消息者的空闲毫秒时间（最后一个字段）以及消费者名称和待处理消息数量
         /// </summary>
@@ -4164,14 +4227,14 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="group"></param>
         /// <returns></returns>
         public (string name, long pending, long idle)[] XInfoConsumers(string key, string group) =>
-            ExecuteScalar(key, (c, k) => c.Value.XInfoConsumers(k, group));
+            ExecuteScalar(key, "XInfoConsumers",(c, k) => c.Value.XInfoConsumers(k, group));
 
         /// <summary>
         /// 返回流中的条目数。如果指定的key不存在，则此命令返回0，就好像该流为空。 但是请注意，与其他的Redis类型不同，零长度流是可能的，所以你应该调用TYPE 或者 EXISTS 来检查一个key是否存在。
         /// </summary>
         /// <param name="key">不含prefix前辍</param>
         /// <returns></returns>
-        public long XLen(string key) => ExecuteScalar(key, (c, k) => c.Value.XLen(k));
+        public long XLen(string key) => ExecuteScalar(key, "XLen", (c, k) => c.Value.XLen(k));
 
         /// <summary>
         /// XPENDING命令是检查待处理消息列表的接口，因此它是一个非常重要的命令，用于观察和了解消费者组正在发生的事情：哪些客户端是活跃的，哪些消息在等待消费，或者查看是否有空闲的消息。此外，该命令与XCLAIM一起使用，用于实现长时间故障的消费者的恢复，因此不处理某些消息：不同的消费者可以认领该消息并继续处理。
@@ -4180,7 +4243,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="group"></param>
         /// <returns></returns>
         public (long count, string minId, string maxId, (string consumer, long count)[] pendings) XPending(string key, string group) =>
-            ExecuteScalar(key, (c, k) => c.Value.XPending(k, group));
+            ExecuteScalar(key, "XPending", (c, k) => c.Value.XPending(k, group));
         /// <summary>
         /// XPENDING命令是检查待处理消息列表的接口，因此它是一个非常重要的命令，用于观察和了解消费者组正在发生的事情：哪些客户端是活跃的，哪些消息在等待消费，或者查看是否有空闲的消息。此外，该命令与XCLAIM一起使用，用于实现长时间故障的消费者的恢复，因此不处理某些消息：不同的消费者可以认领该消息并继续处理。
         /// </summary>
@@ -4192,7 +4255,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="consumer"></param>
         /// <returns></returns>
         public (string id, string consumer, long idle, long transferTimes)[] XPending(string key, string group, string start, string end, long count, string consumer = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.XPending(k, group, start, end, count, consumer = null));
+            ExecuteScalar(key, "XPending",(c, k) => c.Value.XPending(k, group, start, end, count, consumer = null));
 
         /// <summary>
         /// 返回流中满足给定ID范围的条目。范围由最小和最大ID指定。所有ID在指定的两个ID之间或与其中一个ID相等（闭合区间）的条目将会被返回。
@@ -4203,7 +4266,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="count">数量</param>
         /// <returns></returns>
         public (string id, string[] items)[] XRange(string key, string start, string end, long count = 1) =>
-            ExecuteScalar(key, (c, k) => c.Value.XRange(k, start, end, count));
+            ExecuteScalar(key, "XRange",(c, k) => c.Value.XRange(k, start, end, count));
         /// <summary>
         /// 与XRANGE完全相同，但显著的区别是以相反的顺序返回条目，并以相反的顺序获取开始-结束参数：在XREVRANGE中，你需要先指定结束ID，再指定开始ID，该命令就会从结束ID侧开始生成两个ID之间（或完全相同）的所有元素。
         /// </summary>
@@ -4213,7 +4276,7 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="count">数量</param>
         /// <returns></returns>
         public (string id, string[] items)[] XRevRange(string key, string end, string start, long count = 1) =>
-            ExecuteScalar(key, (c, k) => c.Value.XRevRange(k, end, start, count));
+            ExecuteScalar(key, "XRevRange", (c, k) => c.Value.XRevRange(k, end, start, count));
 
         /// <summary>
         /// 从一个或者多个流中读取数据，仅返回ID大于调用者报告的最后接收ID的条目。此命令有一个阻塞选项，用于等待可用的项目，类似于BRPOP或者BZPOPMIN等等。
@@ -4242,96 +4305,96 @@ return 0", $"CSRedisPSubscribe{psubscribeKey}", "", trylong.ToString());
         /// <param name="key">不含prefix前辍</param>
         /// <param name="maxLen">上限流，当小于0时~</param>
         /// <returns></returns>
-        public long XTrim(string key, long maxLen) => ExecuteScalar(key, (c, k) => c.Value.XTrim(k, maxLen));
+        public long XTrim(string key, long maxLen) => ExecuteScalar(key, "XTrim", (c, k) => c.Value.XTrim(k, maxLen));
         #endregion
 
         #region Bloom Filter 4.0
         public bool BfReserve(string key, decimal errorRate, long capacity, int expansion = 2, bool nonScaling = false) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfReserve(k, errorRate, capacity, expansion, nonScaling))) == "OK";
+            ExecuteScalar(key, "BfReserve", (c, k) => c.Value.Write(RedisCommands.BfReserve(k, errorRate, capacity, expansion, nonScaling))) == "OK";
         public bool BfAdd(string key, object item) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfAdd(k, this.SerializeRedisValueInternal(item))));
+            ExecuteScalar(key, "BfAdd", (c, k) => c.Value.Write(RedisCommands.BfAdd(k, this.SerializeRedisValueInternal(item))));
         public bool[] BfMAdd(string key, object[] items) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfMAdd(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
+            ExecuteScalar(key, "BfMAdd", (c, k) => c.Value.Write(RedisCommands.BfMAdd(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
 
         public bool[] BfInsert(string key, object[] items, long? capacity = null, string error = null, int expansion = 2, bool noCreate = false, bool nonScaling = false) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfInsert(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray(), capacity, error, expansion, noCreate, nonScaling)));
+            ExecuteScalar(key, "BfInsert", (c, k) => c.Value.Write(RedisCommands.BfInsert(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray(), capacity, error, expansion, noCreate, nonScaling)));
 
         public bool BfExists(string key, object item) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfExists(k, this.SerializeRedisValueInternal(item))));
+            ExecuteScalar(key, "BfExists", (c, k) => c.Value.Write(RedisCommands.BfExists(k, this.SerializeRedisValueInternal(item))));
         public bool[] BfMExists(string key, object[] items) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfMExists(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
+            ExecuteScalar(key, "BfMExists", (c, k) => c.Value.Write(RedisCommands.BfMExists(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
 
         public RedisScan<byte[]> BfScanDump<T>(string key, long iter) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfScanDump(k, iter)));
+            ExecuteScalar(key, "BfScanDump", (c, k) => c.Value.Write(RedisCommands.BfScanDump(k, iter)));
         public bool BfLoadChunk(string key, long iter, byte[] data) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfLoadChunk(k, iter, data))) == "OK";
+            ExecuteScalar(key, "BfLoadChunk", (c, k) => c.Value.Write(RedisCommands.BfLoadChunk(k, iter, data))) == "OK";
 
         public (long capacity, long size, long numberOfFilters, long numberOfItemsInserted, long expansionRate) BfInfo(string key) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.BfInfo(k)));
+            ExecuteScalar(key, "BfInfo", (c, k) => c.Value.Write(RedisCommands.BfInfo(k)));
         #endregion
 
         #region RedisBloom Cuckoo Filter 4.0
         public bool CfReserve(string key, long capacity, long? bucketSize = null, long? maxIterations = null, int? expansion = null) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfReserve(k, capacity, bucketSize, maxIterations, expansion))) == "OK";
+            ExecuteScalar(key, "CfReserve", (c, k) => c.Value.Write(RedisCommands.CfReserve(k, capacity, bucketSize, maxIterations, expansion))) == "OK";
         public bool CfAdd(string key, object item) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfAdd(false, k, this.SerializeRedisValueInternal(item))));
+            ExecuteScalar(key, "CfAdd", (c, k) => c.Value.Write(RedisCommands.CfAdd(false, k, this.SerializeRedisValueInternal(item))));
         public bool CfAddNx(string key, object item) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfAdd(true, k, this.SerializeRedisValueInternal(item))));
+            ExecuteScalar(key, "CfAddNx", (c, k) => c.Value.Write(RedisCommands.CfAdd(true, k, this.SerializeRedisValueInternal(item))));
 
         public bool[] CfInsert(string key, object[] items, long? capacity = null, bool noCreate = false) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfInsert(false, k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray(), capacity, noCreate)));
+            ExecuteScalar(key, "CfInsert", (c, k) => c.Value.Write(RedisCommands.CfInsert(false, k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray(), capacity, noCreate)));
         public bool[] CfInsertNx(string key, object[] items, long? capacity = null, bool noCreate = false) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfInsert(true, k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray(), capacity, noCreate)));
+            ExecuteScalar(key, "CfInsertNx", (c, k) => c.Value.Write(RedisCommands.CfInsert(true, k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray(), capacity, noCreate)));
 
         public bool CfExists(string key, object item) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfExists(k, this.SerializeRedisValueInternal(item))));
+            ExecuteScalar(key, "CfExists", (c, k) => c.Value.Write(RedisCommands.CfExists(k, this.SerializeRedisValueInternal(item))));
         public bool CfDel(string key, object item) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfDel(k, this.SerializeRedisValueInternal(item))));
+            ExecuteScalar(key, "CfDel", (c, k) => c.Value.Write(RedisCommands.CfDel(k, this.SerializeRedisValueInternal(item))));
         public long CfCount(string key, object item) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfCount(k, this.SerializeRedisValueInternal(item))));
+            ExecuteScalar(key, "CfCount", (c, k) => c.Value.Write(RedisCommands.CfCount(k, this.SerializeRedisValueInternal(item))));
 
         public RedisScan<byte[]> CfScanDump<T>(string key, long iter) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfScanDump(k, iter)));
+            ExecuteScalar(key, "CfScanDump", (c, k) => c.Value.Write(RedisCommands.CfScanDump(k, iter)));
         public bool CfLoadChunk(string key, long iter, byte[] data) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfLoadChunk(k, iter, data))) == "OK";
+            ExecuteScalar(key, "CfLoadChunk", (c, k) => c.Value.Write(RedisCommands.CfLoadChunk(k, iter, data))) == "OK";
         public (long size, long numberOfBuckets, long numberOfFilter, long numberOfItemsInserted, long numberOfItemsDeleted, long bucketSize, long expansionRate, long maxIteration) CfInfo(string key) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CfInfo(k)));
+            ExecuteScalar(key, "CfInfo", (c, k) => c.Value.Write(RedisCommands.CfInfo(k)));
         #endregion
 
         #region RedisBloom Count-Min Sketch 4.0
         public bool CmsInitByDim(string key, long width, long depth) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CmsInitByDim(k, width, depth))) == "OK";
+            ExecuteScalar(key, "CmsInitByDim", (c, k) => c.Value.Write(RedisCommands.CmsInitByDim(k, width, depth))) == "OK";
         public bool CmsInitByProb(string key, decimal error, decimal probability) =>
-           ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CmsInitByProb(k, error, probability))) == "OK";
+           ExecuteScalar(key, "CmsInitByProb", (c, k) => c.Value.Write(RedisCommands.CmsInitByProb(k, error, probability))) == "OK";
 
         public long[] CmsIncrBy(string key, params (object item, long increment)[] items) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CmsIncrBy(k, items.Select(item => (this.SerializeRedisValueInternal(item.item), item.increment)).ToArray())));
+            ExecuteScalar(key, "CmsIncrBy", (c, k) => c.Value.Write(RedisCommands.CmsIncrBy(k, items.Select(item => (this.SerializeRedisValueInternal(item.item), item.increment)).ToArray())));
         public long[] CmsQuery(string key, params object[] items) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CmsQuery(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
+            ExecuteScalar(key, "CmsQuery", (c, k) => c.Value.Write(RedisCommands.CmsQuery(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
         public bool CmsMerge(string dest, long numKeys, string[] src, long[] weights) =>
             NodesNotSupport(new[] { dest }.Concat(src).ToArray(), null, (c, k) => c.Value.Write(RedisCommands.CmsMerge(k.FirstOrDefault(), numKeys, k.Where((_, idx) => idx > 0).ToArray(), weights))) == "OK";
         public (long width, long depth, long count) CmsInfo(string key) =>
-           ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.CmsInfo(k)));
+           ExecuteScalar(key, "CmsInfo", (c, k) => c.Value.Write(RedisCommands.CmsInfo(k)));
         #endregion
 
         #region RedisBloom TopK Filter 4.0
         public bool TopkReserve(string key, long topk, long width, long depth, decimal decay) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.TopkReserve(k, topk, width, depth, decay))) == "OK";
+            ExecuteScalar(key, "TopkReserve", (c, k) => c.Value.Write(RedisCommands.TopkReserve(k, topk, width, depth, decay))) == "OK";
 
         public string[] TopkAdd(string key, object[] items) =>
-           ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.TopkAdd(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
+           ExecuteScalar(key, "TopkAdd", (c, k) => c.Value.Write(RedisCommands.TopkAdd(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
         public string[] TopkIncrBy(string key, params (object item, long increment)[] items) =>
-            ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.TopkIncrBy(k, items.Select(item => (this.SerializeRedisValueInternal(item.item), item.increment)).ToArray())));
+            ExecuteScalar(key, "TopkIncrBy", (c, k) => c.Value.Write(RedisCommands.TopkIncrBy(k, items.Select(item => (this.SerializeRedisValueInternal(item.item), item.increment)).ToArray())));
 
         public bool[] TopkQuery(string key, object[] items) =>
-           ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.TopkQuery(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
+           ExecuteScalar(key, "TopkQuery", (c, k) => c.Value.Write(RedisCommands.TopkQuery(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
         public long[] TopkCount(string key, object[] items) =>
-           ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.TopkCount(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
+           ExecuteScalar(key, "TopkCount", (c, k) => c.Value.Write(RedisCommands.TopkCount(k, items.Select(item => this.SerializeRedisValueInternal(item)).ToArray())));
 
         public string[] TopkList(string key) =>
-           ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.TopkList(k)));
+           ExecuteScalar(key, "TopkList", (c, k) => c.Value.Write(RedisCommands.TopkList(k)));
         public (long k, long width, long depth, decimal decay) TopkInfo(string key) =>
-           ExecuteScalar(key, (c, k) => c.Value.Write(RedisCommands.TopkInfo(k)));
+           ExecuteScalar(key, "TopkInfo", (c, k) => c.Value.Write(RedisCommands.TopkInfo(k)));
         #endregion
 
         /// <summary>

@@ -15,7 +15,7 @@
 | CSRedisCore | [![nuget](https://img.shields.io/nuget/v/CSRedisCore.svg?style=flat-square)](https://www.nuget.org/packages/CSRedisCore) | [![stats](https://img.shields.io/nuget/dt/CSRedisCore.svg?style=flat-square)](https://www.nuget.org/stats/packages/CSRedisCore?groupby=Version) |
 | Caching.CSRedis | [![nuget](https://img.shields.io/nuget/v/Caching.CSRedis.svg?style=flat-square)](https://www.nuget.org/packages/Caching.CSRedis) | [![stats](https://img.shields.io/nuget/dt/Caching.CSRedis.svg?style=flat-square)](https://www.nuget.org/stats/packages/Caching.CSRedis?groupby=Version) | IDistributedCache |
 
-> dotnet add package CSRedisCore
+> dotnet add package CSRedisCore.YahuiWong
 
 ## Single machine redis
 
@@ -65,7 +65,7 @@ Read only: new CSRedisClient("mymaster,password=123", new [] { Sentinels }, fals
 
 # IDistributedCache
 
-> dotnet add package Caching.CSRedis
+> dotnet add package Caching.CSRedis.YahuiWong
 
 ```csharp
 RedisHelper.Initialization(csredis);
