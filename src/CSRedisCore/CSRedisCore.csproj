@@ -4,7 +4,7 @@
 		<AssemblyName>CSRedisCore</AssemblyName>
 		<PackageId>CSRedisCore.YahuiWong</PackageId>
 		<RootNamespace>CSRedisCore</RootNamespace>
-		<Version>1.0.0.4</Version>
+		<Version>3.6.5.1</Version>
 		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
 		<PackageProjectUrl>https://github.com/YahuiWong/csredis</PackageProjectUrl>
 		<Description>CSRedis 是 redis.io 官方推荐库，支持 redis-trib集群、哨兵、私有分区与连接池管理技术，简易 RedisHelper 静态类。</Description>
